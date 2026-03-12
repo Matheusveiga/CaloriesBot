@@ -104,15 +104,20 @@ def get_user_profile(user_id: str):
         return None
 
 def get_daily_total(user_id: str):
-    """Calculates the total calories for the current day using SQL Sum."""
+    """Calculates the total calories for the current day using Brazil Time (UTC-3)."""
     try:
-        today = datetime.now().strftime("%Y-%m-%d")
+        # Ajuste manual para o fuso do usuário (Brasília UTC-3)
+        # Note: In production, consider asking for user's TZ or using a more robust method
+        now_utc = datetime.utcnow()
+        now_br = now_utc - timedelta(hours=3)
+        today_br = now_br.strftime("%Y-%m-%d")
+        
         response = supabase.table("logs") \
             .select("kcal") \
             .eq("user_id", str(user_id)) \
-            .gte("created_at", today) \
+            .gte("created_at", today_br) \
             .execute()
-        return sum(item['kcal'] for item in response.data)
+        return sum(item.get('kcal', 0) for item in response.data)
     except Exception as e:
         logger.error(f"Erro ao calcular total diário: {e}")
         return 0
@@ -120,7 +125,10 @@ def get_daily_total(user_id: str):
 def get_report_data(user_id: str, days: int):
     """Aggregates data for periodic reports."""
     try:
-        start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        now_utc = datetime.utcnow()
+        now_br = now_utc - timedelta(hours=3)
+        start_date = (now_br - timedelta(days=days)).strftime("%Y-%m-%d")
+        
         response = supabase.table("logs") \
             .select("created_at, kcal") \
             .eq("user_id", str(user_id)) \
@@ -147,13 +155,14 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
     OBJETIVO: Identificar APENAS OS NOVOS alimentos da "ENTRADA ATUAL".
     
     REGRAS CRÍTICAS:
-    1. O JSON retornado deve conter APENAS alimentos que o usuário acabou de mencionar ou enviar na foto. 
-    2. NUNCA repita alimentos que já aparecem no "CONTEXTO" abaixo, a menos que o usuário explicitamente diga que comeu MAIS uma unidade.
-    3. Use o "CONTEXTO" APENAS para entender referências (ex: "e mais um desse" ou "repeti o anterior").
-    4. Se a "ENTRADA ATUAL" não trouxer nada novo, retorne uma lista vazia: [].
+    1. O JSON retornado deve conter APENAS alimentos que o usuário acabou de mencionar ou enviar na foto agora. 
+    2. NUNCA repita alimentos que já aparecem no "CONTEXTO" abaixo.
+    3. Use o "CONTEXTO" APENAS para entender referências (ex: "e mais um desse").
+    4. Se a "ENTRADA ATUAL" não trouxer nada novo, retorne: []
     5. Responda APENAS com uma lista JSON: [ {{"alimento": "str", "peso": "str", "calorias": int}} ]
+    6. Garanta que o campo "calorias" seja sempre um NÚMERO INTEIRO maior que zero.
     
-    CONTEXTO (Alimentos já processados recentemente):
+    CONTEXTO (Logs recentes):
     {history_ctx}
     
     ENTRADA ATUAL: "{message_text}"
@@ -162,7 +171,6 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
     contents = [prompt]
     if image_bytes:
         contents.append(ai_types.Part.from_bytes(data=image_bytes, mime_type='image/jpeg'))
-        # No prompt update needed here as it's already in the main prompt
 
     raw_text = ""
     try:
@@ -181,22 +189,24 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
             
         items = json.loads(cleaned_text.strip())
         
+        # Sanitize and force types
+        sanitized_items = []
+        for item in items:
+            if isinstance(item, dict) and item.get("alimento"):
+                item["calorias"] = int(float(item.get("calorias", 0)))
+                sanitized_items.append(item)
+        
         # Update memory with what was actually extracted
-        if items:
+        if sanitized_items:
             if user_id not in user_history: user_history[user_id] = []
-            extracted_summary = ", ".join([f"{i['alimento']} ({i['peso']})" for i in items])
+            extracted_summary = ", ".join([f"{i['alimento']} ({i['peso']})" for i in sanitized_items])
             user_history[user_id].append(f"LOGADO ANTERIORMENTE: {extracted_summary}")
-            
-            # Keep only last 10 locally
             if len(user_history[user_id]) > 10: user_history[user_id] = user_history[user_id][-10:]
 
-        return items, None, raw_text
-    except json.JSONDecodeError:
-        logger.error(f"Failed to parse JSON. Raw: {raw_text}")
-        return None, "json_error", raw_text
+        return sanitized_items, None, raw_text
     except Exception as e:
-        logger.error(f"Gemini technical error: {e}")
-        print(f"DEBUG GEMINI: {str(e)}") # Visible on Render Logs
+        logger.error(f"Gemini error: {e}")
+        print(f"DEBUG GEMINI RAW: {raw_text}")
         return None, "ai_error", str(e)
 
 # --- Mifflin-St Jeor ---

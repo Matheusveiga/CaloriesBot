@@ -144,14 +144,16 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
 
     prompt = f"""
     Você é um nutricionista especialista em análise calórica.
-    OBJETIVO: Identificar alimentos e calcular calorias.
+    OBJETIVO: Identificar APENAS OS NOVOS alimentos da "ENTRADA ATUAL".
     
-    INSTRUÇÕES:
-    1. Identifique cada alimento separadamente.
-    2. Estime pesos se necessário.
-    3. Responda APENAS com uma lista JSON: [ {{"alimento": "str", "peso": "str", "calorias": int}} ]
+    REGRAS CRÍTICAS:
+    1. O JSON retornado deve conter APENAS alimentos que o usuário acabou de mencionar ou enviar na foto. 
+    2. NUNCA repita alimentos que já aparecem no "CONTEXTO" abaixo, a menos que o usuário explicitamente diga que comeu MAIS uma unidade.
+    3. Use o "CONTEXTO" APENAS para entender referências (ex: "e mais um desse" ou "repeti o anterior").
+    4. Se a "ENTRADA ATUAL" não trouxer nada novo, retorne uma lista vazia: [].
+    5. Responda APENAS com uma lista JSON: [ {{"alimento": "str", "peso": "str", "calorias": int}} ]
     
-    CONTEXTO (Últimas mensagens do usuário):
+    CONTEXTO (Alimentos já processados recentemente):
     {history_ctx}
     
     ENTRADA ATUAL: "{message_text}"
@@ -160,7 +162,7 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
     contents = [prompt]
     if image_bytes:
         contents.append(ai_types.Part.from_bytes(data=image_bytes, mime_type='image/jpeg'))
-        prompt += "\n(ANALISE TAMBÉM A IMAGEM ANEXADA)"
+        # No prompt update needed here as it's already in the main prompt
 
     raw_text = ""
     try:
@@ -179,10 +181,12 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
             
         items = json.loads(cleaned_text.strip())
         
-        # Update memory if it's text
-        if message_text:
+        # Update memory with what was actually extracted
+        if items:
             if user_id not in user_history: user_history[user_id] = []
-            user_history[user_id].append(f"Usuário: {message_text}")
+            extracted_summary = ", ".join([f"{i['alimento']} ({i['peso']})" for i in items])
+            user_history[user_id].append(f"LOGADO ANTERIORMENTE: {extracted_summary}")
+            
             # Keep only last 10 locally
             if len(user_history[user_id]) > 10: user_history[user_id] = user_history[user_id][-10:]
 
@@ -474,6 +478,9 @@ async def telegram_webhook(request: Request):
 
 @app.get("/")
 def index(): return {"status": "Bot is running"}
+
+@app.get("/api/health")
+def health_check(): return {"status": "ok"}
 
 @app.on_event("startup")
 async def on_startup():

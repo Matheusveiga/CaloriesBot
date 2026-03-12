@@ -25,6 +25,19 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL")
 
+# Validation
+missing_vars = []
+if not TELEGRAM_TOKEN: missing_vars.append("TELEGRAM_BOT_TOKEN")
+if not GEMINI_KEY: missing_vars.append("GEMINI_API_KEY")
+if not SUPABASE_URL: missing_vars.append("SUPABASE_URL")
+if not SUPABASE_KEY: missing_vars.append("SUPABASE_KEY")
+if not WEBHOOK_URL: missing_vars.append("RENDER_EXTERNAL_URL")
+
+if missing_vars:
+    error_msg = f"❌ Faltando variáveis de ambiente: {', '.join(missing_vars)}"
+    logger.error(error_msg)
+    raise ValueError(error_msg)
+
 # Init Aiogram
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())

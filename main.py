@@ -139,6 +139,25 @@ def get_report_data(user_id: str, days: int):
         logger.error(f"Erro ao buscar dados do relatório: {e}")
         return []
 
+def delete_last_log(user_id: str):
+    """Deletes the most recent log entry for a user."""
+    try:
+        res = supabase.table("logs") \
+            .select("id") \
+            .eq("user_id", str(user_id)) \
+            .order("created_at", desc=True) \
+            .limit(1) \
+            .execute()
+        
+        if res.data:
+            log_id = res.data[0]['id']
+            supabase.table("logs").delete().eq("id", log_id).execute()
+            return True
+        return False
+    except Exception as e:
+        logger.error(f"Erro ao deletar último log: {e}")
+        return False
+
 # --- AI Logic ---
 
 async def extract_calories_list(user_id: int, message_text: str = "", image_bytes: Optional[bytes] = None):
@@ -151,16 +170,15 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
     history_ctx = "\n".join(history[-5:]) if history else "Sem histórico."
 
     prompt = f"""
-    Você é um nutricionista especialista em análise calórica.
+    Você é um nutricionista especialista em análise calórica com ACESSO À PESQUISA GOOGLE.
     OBJETIVO: Identificar APENAS OS NOVOS alimentos da "ENTRADA ATUAL".
     
-    REGRAS CRÍTICAS:
-    1. O JSON retornado deve conter APENAS alimentos que o usuário acabou de mencionar ou enviar na foto agora. 
-    2. NUNCA repita alimentos que já aparecem no "CONTEXTO" abaixo.
-    3. Use o "CONTEXTO" APENAS para entender referências (ex: "e mais um desse").
-    4. Se a "ENTRADA ATUAL" não trouxer nada novo, retorne: []
-    5. Responda APENAS com uma lista JSON: [ {{"alimento": "str", "peso": "str", "calorias": int}} ]
-    6. Garanta que o campo "calorias" seja sempre um NÚMERO INTEIRO maior que zero.
+    REGRAS DE PORTIONS E PESOS (CRÍTICO):
+    1. Se o usuário disser "300g de macarrão com carne", o peso TOTAL é 300g. NÃO atribua 300g para cada item separadamente. Divida o peso logicamente (ex: 200g macarrão, 100g carne).
+    2. Se o peso não bater com a realidade calórica, use o Google Search para verificar valores nutricionais padrão.
+    3. Retorne APENAS alimentos novos. NUNCA repita o que já está no CONTEXTO.
+    4. Responda APENAS com uma lista JSON: [ {{"alimento": "str", "peso": "str", "calorias": int}} ]
+    5. O valor de "calorias" deve ser maior que zero e baseado em dados reais.
     
     CONTEXTO (Logs recentes):
     {history_ctx}
@@ -168,6 +186,11 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
     ENTRADA ATUAL: "{message_text}"
     """
     
+    # Configurar ferramentas (Pesquisa Google)
+    config = ai_types.GenerateContentConfig(
+        tools=[ai_types.Tool(google_search=ai_types.GoogleSearch())]
+    )
+
     contents = [prompt]
     if image_bytes:
         contents.append(ai_types.Part.from_bytes(data=image_bytes, mime_type='image/jpeg'))
@@ -176,7 +199,8 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
     try:
         response = ai_client.models.generate_content(
             model=AI_MODEL,
-            contents=contents
+            contents=contents,
+            config=config # Habilita o Google Search
         )
         raw_text = response.text
         
@@ -264,9 +288,20 @@ async def cmd_help(message: types.Message):
         "2. **Fotos:** Mande uma foto do prato e eu estimo as calorias.\n"
         "3. **Memória:** Eu entendo frases como 'e mais uma coca zero'.\n"
         "4. **Perfil:** Use /perfil para atualizar seus dados.\n"
-        "5. **Relatórios:** Use /relatorio para ver seu progresso."
+        "5. **Relatórios:** Use /relatorio para ver seu progresso.\n"
+        "6. **Desfazer:** Errou algo? Use /desfazer para remover o último log."
     )
     await message.answer(help_text, parse_mode="Markdown")
+
+@dp.message(Command("desfazer"))
+async def cmd_undo(message: types.Message):
+    if delete_last_log(message.from_user.id):
+        # Remove a última entrada da memória da IA também para manter coerência
+        if message.from_user.id in user_history and user_history[message.from_user.id]:
+            user_history[message.from_user.id].pop()
+        await message.answer("🔄 A última entrada foi removida com sucesso!")
+    else:
+        await message.answer("❌ Não encontrei entradas recentes para remover.")
 
 @dp.message(Command("cancelar"))
 async def cmd_cancel(message: types.Message, state: FSMContext):

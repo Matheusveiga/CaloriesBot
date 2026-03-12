@@ -38,6 +38,16 @@ if missing_vars:
     logger.error(error_msg)
     raise ValueError(error_msg)
 
+# Deep Validation for SUPABASE_URL
+SUPABASE_URL = SUPABASE_URL.strip()
+if not SUPABASE_URL.startswith("https://"):
+    error_msg = f"❌ SUPABASE_URL inválida: Deve começar com https://. Valor detectado: {SUPABASE_URL[:10]}..."
+    logger.error(error_msg)
+    raise ValueError(error_msg)
+
+if "supabase.co" not in SUPABASE_URL:
+    logger.warning("⚠️ SUPABASE_URL não parece ser uma URL padrão do Supabase (.supabase.co)")
+
 # Init Aiogram
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -50,21 +60,28 @@ model = genai.GenerativeModel('gemini-1.5-flash')
 # Init Supabase
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# Prevent duplicate processing (Simple Memory Cache)
+# In production with multiple workers, this would need Redis
+processed_messages = set()
+
 # DB Logic
-def log_calorie(user_id: str, user_name: str, food: str, weight: str, kcal: int):
-    data = {
-        "food": food,
-        "weight": weight,
-        "kcal": kcal,
-        "user_id": str(user_id),
-        "user_name": user_name
-    }
-    supabase.table("logs").insert(data).execute()
+def log_calories(user_id: str, user_name: str, items: list):
+    """Logs a list of items to Supabase."""
+    prepared_data = []
+    for item in items:
+        prepared_data.append({
+            "food": item.get("alimento"),
+            "weight": item.get("peso"),
+            "kcal": item.get("calorias"),
+            "user_id": str(user_id),
+            "user_name": user_name
+        })
+    if prepared_data:
+        supabase.table("logs").insert(prepared_data).execute()
     return True
 
 def get_daily_total(user_id: str):
     today = datetime.now().strftime("%Y-%m-%d")
-    # Using filter for today's date (assuming created_at is timestamptz)
     response = supabase.table("logs") \
         .select("kcal") \
         .eq("user_id", str(user_id)) \
@@ -75,21 +92,26 @@ def get_daily_total(user_id: str):
     return total
 
 # AI Logic
-async def extract_calories(message_text: str):
+async def extract_calories_list(message_text: str):
     prompt = f"""
     Você é um nutricionista especialista em cálculo calórico.
     Analise a frase do usuário: "{message_text}"
-    Extraia o alimento, o peso/quantidade aproximada e calcule as calorias totais.
-    Responda APENAS em JSON no formato:
-    {{"alimento": "string", "peso": "string", "calorias": integer}}
+    Identifique TODOS os alimentos e seus respectivos pesos/quantidades.
+    Calcule as calorias de cada um.
+    Responda APENAS em JSON no formato de uma LISTA de objetos:
+    [
+      {{"alimento": "string", "peso": "string", "calorias": integer}},
+      ...
+    ]
+    Se não encontrar nenhum alimento, responda: []
     """
-    response = model.generate_content(prompt)
     try:
+        response = model.generate_content(prompt)
         import json
         cleaned_text = response.text.strip().replace('```json', '').replace('```', '')
         return json.loads(cleaned_text)
     except Exception as e:
-        logger.error(f"Error parsing Gemini response: {e}")
+        logger.error(f"Error calling or parsing Gemini: {e}")
         return None
 
 # Bot Handlers
@@ -102,28 +124,42 @@ async def handle_message(message: types.Message):
     if not message.text:
         return
 
+    # Duplicate Check
+    msg_id = f"{message.chat.id}:{message.message_id}"
+    if msg_id in processed_messages:
+        return
+    processed_messages.add(msg_id)
+    # Simple cleanup to keep memory low
+    if len(processed_messages) > 1000:
+        processed_messages.clear()
+
     status_msg = await message.answer("Calculando... 🧐")
     
-    data = await extract_calories(message.text)
-    if not data:
-        await status_msg.edit_text("Ops, não consegui entender o alimento. Tente dizer algo como '100g de arroz'.")
+    items = await extract_calories_list(message.text)
+    
+    if items is None:
+        await status_msg.edit_text("❌ Erro ao processar com a IA. Tente descrever os alimentos de forma mais simples.")
+        return
+        
+    if len(items) == 0:
+        await status_msg.edit_text("🤔 Não identifiquei nenhum alimento na sua frase. Tente dizer algo como 'comi 1 pão e 2 ovos'.")
         return
 
-    food = data.get("alimento")
-    weight = data.get("peso")
-    kcal = data.get("calorias")
-    
     # Log to DB
-    log_calorie(message.from_user.id, message.from_user.full_name, food, weight, kcal)
+    log_calories(message.from_user.id, message.from_user.full_name, items)
     
     # Get total
     daily_total = get_daily_total(message.from_user.id)
     daily_limit = 2000 
     remaining = daily_limit - daily_total
 
+    # Format items output
+    items_text = ""
+    for item in items:
+        items_text += f"✅ **{item['alimento']}** ({item['peso']}) 🔥 {item['calorias']} kcal\n"
+
     response_text = (
-        f"✅ **{food}** ({weight})\n"
-        f"🔥 Calorias: {kcal} kcal\n\n"
+        f"{items_text}\n"
         f"📊 **Resumo de Hoje:**\n"
         f"Soma: {daily_total} kcal\n"
         f"Meta: {daily_limit} kcal\n"

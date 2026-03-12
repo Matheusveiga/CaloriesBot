@@ -479,7 +479,7 @@ async def telegram_webhook(request: Request):
 @app.get("/")
 def index(): return {"status": "Bot is running"}
 
-@app.get("/api/health")
+@app.api_route("/api/health", methods=["GET", "POST", "HEAD"])
 def health_check(): return {"status": "ok"}
 
 @app.on_event("startup")

@@ -54,7 +54,7 @@ app = FastAPI()
 
 # Init Gemini (New SDK)
 ai_client = genai.Client(api_key=GEMINI_KEY)
-AI_MODEL = "gemini-1.5-flash" # Estável e funcional na SDK nova
+AI_MODEL = "gemini-2.0-flash"  # Atualizado para a versão 2.0 que é a recomendada agora
 
 # Init Supabase
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)

@@ -1,17 +1,19 @@
 import os
 import logging
 import json
+import io
 from datetime import datetime, timedelta
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command, StateFilter
-from aiogram.types import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import Command, StateFilter, CommandObject
+from aiogram.types import Update, InlineKeyboardMarkup, InlineKeyboardButton, PhotoSize
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from google import genai
+from google.genai import types as ai_types
 from supabase import create_client, Client
 from dotenv import load_dotenv
 
@@ -54,7 +56,7 @@ app = FastAPI()
 
 # Init Gemini (New SDK)
 ai_client = genai.Client(api_key=GEMINI_KEY)
-AI_MODEL = "gemini-2.5-flash-lite"  # Atualizado para a versão 2.5 Lite conforme imagem
+AI_MODEL = "gemini-2.5-flash-lite"
 
 # Init Supabase
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -67,7 +69,9 @@ class ProfileStates(StatesGroup):
     gender = State()
     activity = State()
 
+# Memory and Duplicate protection
 processed_messages = set()
+user_history: Dict[int, List[str]] = {}
 
 # --- DB Logic ---
 
@@ -129,35 +133,40 @@ def get_report_data(user_id: str, days: int):
 
 # --- AI Logic ---
 
-async def extract_calories_list(message_text: str):
+async def extract_calories_list(user_id: int, message_text: str = "", image_bytes: Optional[bytes] = None):
     """
-    Calls Gemini to extract food items. 
+    Calls Gemini to extract food items from text or image. 
     Returns (items_list, error_type, raw_response)
     """
+    # Get history
+    history = user_history.get(user_id, [])
+    history_ctx = "\n".join(history[-5:]) if history else "Sem histórico."
+
     prompt = f"""
-    Você é um nutricionista especialista em cálculo calórico. 
-    Analise a frase do usuário e extraia TODOS os alimentos, pesos/quantidades e calcule as calorias.
-    
-    FRASE: "{message_text}"
+    Você é um nutricionista especialista em análise calórica.
+    OBJETIVO: Identificar alimentos e calcular calorias.
     
     INSTRUÇÕES:
-    1. Identifique cada item separadamente (ex: pão, requeijão, macarrão, carne).
-    2. Estime o peso se não for fornecido explicitamente.
-    3. Responda APENAS com uma lista JSON válida.
+    1. Identifique cada alimento separadamente.
+    2. Estime pesos se necessário.
+    3. Responda APENAS com uma lista JSON: [ {{"alimento": "str", "peso": "str", "calorias": int}} ]
     
-    EXEMPLO DE SAÍDA:
-    [
-      {{"alimento": "pão francês", "peso": "50g", "calorias": 135}},
-      {{"alimento": "requeijão light", "peso": "30g", "calorias": 50}}
-    ]
+    CONTEXTO (Últimas mensagens do usuário):
+    {history_ctx}
     
-    Se não houver alimentos, retorne: []
+    ENTRADA ATUAL: "{message_text}"
     """
+    
+    contents = [prompt]
+    if image_bytes:
+        contents.append(ai_types.Part.from_bytes(data=image_bytes, mime_type='image/jpeg'))
+        prompt += "\n(ANALISE TAMBÉM A IMAGEM ANEXADA)"
+
     raw_text = ""
     try:
         response = ai_client.models.generate_content(
             model=AI_MODEL,
-            contents=prompt
+            contents=contents
         )
         raw_text = response.text
         
@@ -169,12 +178,21 @@ async def extract_calories_list(message_text: str):
             cleaned_text = cleaned_text.split("```")[1].split("```")[0]
             
         items = json.loads(cleaned_text.strip())
+        
+        # Update memory if it's text
+        if message_text:
+            if user_id not in user_history: user_history[user_id] = []
+            user_history[user_id].append(f"Usuário: {message_text}")
+            # Keep only last 10 locally
+            if len(user_history[user_id]) > 10: user_history[user_id] = user_history[user_id][-10:]
+
         return items, None, raw_text
     except json.JSONDecodeError:
         logger.error(f"Failed to parse JSON. Raw: {raw_text}")
         return None, "json_error", raw_text
     except Exception as e:
         logger.error(f"Gemini technical error: {e}")
+        print(f"DEBUG GEMINI: {str(e)}") # Visible on Render Logs
         return None, "ai_error", str(e)
 
 # --- Mifflin-St Jeor ---
@@ -216,10 +234,10 @@ async def cmd_start(message: types.Message, state: FSMContext):
             f"👋 Olá de novo, **{message.from_user.first_name}**!\n\n"
             f"🎯 Sua meta atual: **{profile['tdee']} kcal**\n\n"
             "Escolha uma opção:\n"
-            "🔹 /perfil - Atualizar peso/meta\n"
             "🔹 /relatorio - Ver estatísticas\n"
+            "🔹 /perfil - Recalcular meta\n"
             "🔹 /ajuda - Como usar o bot\n\n"
-            "Ou apenas me diga o que comeu! 🍎",
+            "DICA: Você pode me mandar **fotos** da sua comida! 📸",
             parse_mode="Markdown"
         )
 
@@ -227,11 +245,12 @@ async def cmd_start(message: types.Message, state: FSMContext):
 async def cmd_help(message: types.Message):
     help_text = (
         "📖 **Como usar o Bot de Calorias:**\n\n"
-        "1. **Contagem:** Basta digitar o que comeu. \n"
-        "   Ex: '2 ovos e 1 pão' ou '300g de lasanha'.\n"
-        "2. **Perfil:** Use /perfil para recalcular sua meta baseada no seu peso atual.\n"
-        "3. **Relatórios:** Use /relatorio para acompanhar sua evolução.\n\n"
-        "💡 *Dica:* Quanto mais específico você for (gramas, unidades), mais preciso eu serei!"
+        "1. **Texto:** Diga o que comeu. \n"
+        "   Ex: '2 ovos e 1 pão' ou 'repeti o almoço'.\n"
+        "2. **Fotos:** Mande uma foto do prato e eu estimo as calorias.\n"
+        "3. **Memória:** Eu entendo frases como 'e mais uma coca zero'.\n"
+        "4. **Perfil:** Use /perfil para atualizar seus dados.\n"
+        "5. **Relatórios:** Use /relatorio para ver seu progresso."
     )
     await message.answer(help_text, parse_mode="Markdown")
 
@@ -252,7 +271,7 @@ async def process_weight(message: types.Message, state: FSMContext):
     try:
         weight = float(message.text.replace(',', '.'))
         await state.update_data(weight=weight)
-        await message.answer("Qual sua **altura** em cm? (ex: 175)")
+        await message.answer("2️⃣ Qual sua **altura** em cm? (ex: 175)")
         await state.set_state(ProfileStates.height)
     except:
         await message.answer("Por favor, envie um número válido.")
@@ -262,7 +281,7 @@ async def process_height(message: types.Message, state: FSMContext):
     try:
         height = float(message.text)
         await state.update_data(height=height)
-        await message.answer("Qual sua **idade**?")
+        await message.answer("3️⃣ Qual sua **idade**?")
         await state.set_state(ProfileStates.age)
     except:
         await message.answer("Por favor, envie um número válido.")
@@ -276,7 +295,7 @@ async def process_age(message: types.Message, state: FSMContext):
             [InlineKeyboardButton(text="Masculino", callback_data="g_M"), 
              InlineKeyboardButton(text="Feminino", callback_data="g_F")]
         ])
-        await message.answer("Qual seu **sexo**?", reply_markup=kb)
+        await message.answer("4️⃣ Qual seu **sexo**?", reply_markup=kb)
         await state.set_state(ProfileStates.gender)
     except:
         await message.answer("Por favor, envie um número válido.")
@@ -292,7 +311,7 @@ async def process_gender(callback: types.CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="Ativo (6-7 dias/sem)", callback_data="act_ativo")],
         [InlineKeyboardButton(text="Atleta (2x dia)", callback_data="act_atleta")]
     ])
-    await callback.message.edit_text("Qual seu nível de **atividade física**?", reply_markup=kb)
+    await callback.message.edit_text("5️⃣ Qual seu nível de **atividade física**?", reply_markup=kb)
     await state.set_state(ProfileStates.activity)
 
 @dp.callback_query(ProfileStates.activity, F.data.startswith("act_"))
@@ -317,7 +336,7 @@ async def process_activity(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.edit_text(
         f"✅ Perfil configurado!\n"
         f"Sua meta diária é: **{tdee} kcal**\n\n"
-        f"Agora é só me mandar seus alimentos!"
+        f"Agora é só me mandar seus alimentos ou uma foto do prato! 📸🍎"
     )
 
 # --- Reporting ---
@@ -359,34 +378,16 @@ async def process_report(callback: types.CallbackQuery):
         logger.error(f"Erro ao gerar relatório: {e}")
         await callback.answer("❌ Erro ao gerar relatório.")
 
-# --- Food Handling ---
+# --- Food and Vision Handling ---
 
-@dp.message(F.text, StateFilter(None))
-async def handle_message(message: types.Message):
-    msg_id = f"{message.chat.id}:{message.message_id}"
-    if msg_id in processed_messages: return
-    processed_messages.add(msg_id)
-    if len(processed_messages) > 1000: processed_messages.clear()
-
-    status_msg = await message.answer("Calculando... 🧐")
-    
-    items, error_type, raw_data = await extract_calories_list(message.text)
-    
-    if error_type == "ai_error":
-        await status_msg.edit_text(f"❌ Erro técnico na IA: {raw_data[:50]}...")
-        return
-    elif error_type == "json_error":
-        await status_msg.edit_text("❌ A IA respondeu em um formato que não consegui ler. Tente simplificar a frase.")
-        logger.warning(f"JSON Error. Raw: {raw_data}")
-        return
-        
-    if items is not None and len(items) == 0:
-        await status_msg.edit_text("🤔 Não identifiquei nenhum alimento. Tente algo como '1 pão e 2 ovos'.")
+async def process_food_entry(message: types.Message, items: list, raw_data: str):
+    """Common logic for saving and responding to food entries."""
+    if not items:
         return
 
-    # Log to DB with error handling
+    # Log to DB
     if not log_calories(message.from_user.id, message.from_user.full_name, items):
-        await status_msg.edit_text("❌ Erro ao salvar os dados no banco de dados. Tente novamente mais tarde.")
+        await message.answer("❌ Erro ao salvar dados no Supabase.")
         return
     
     profile = get_user_profile(message.from_user.id)
@@ -399,17 +400,69 @@ async def handle_message(message: types.Message):
         items_text += f"{emoji} **{i['alimento']}** ({i['peso']}) → {i['calorias']} kcal\n"
         
     remaining = daily_limit - daily_total
-    progress_bar = "🔵" * min(10, round((daily_total/daily_limit)*10)) + "⚪" * max(0, 10 - round((daily_total/daily_limit)*10))
+    progress_val = min(10, round((daily_total/daily_limit)*10)) if daily_limit > 0 else 0
+    progress_bar = "🔵" * progress_val + "⚪" * (10 - progress_val)
 
-    await status_msg.edit_text(
+    response_text = (
         f"{items_text}\n"
         f"📊 **CONTAGEM DE HOJE**\n"
         f"━━━━━━━━━━━━━━━\n"
         f"🔥 Soma: **{daily_total}** / {daily_limit} kcal\n"
         f"⚖️ Restante: **{max(0, remaining)} kcal**\n\n"
-        f"{progress_bar}",
-        parse_mode="Markdown"
+        f"{progress_bar}"
     )
+    await message.answer(response_text, parse_mode="Markdown")
+
+@dp.message(F.photo, StateFilter(None))
+async def handle_photo(message: types.Message):
+    status_msg = await message.answer("Analisando foto... 📸👀")
+    
+    # Get the best photo size
+    photo = message.photo[-1]
+    file = await bot.get_file(photo.file_id)
+    photo_bytes = io.BytesIO()
+    await bot.download_file(file.file_path, destination=photo_bytes)
+    
+    items, error_type, raw_data = await extract_calories_list(
+        user_id=message.from_user.id,
+        image_bytes=photo_bytes.getvalue(),
+        message_text=message.caption or "Foto de comida"
+    )
+
+    await status_msg.delete()
+    if error_type:
+        await message.answer(f"❌ Erro na análise da foto: {error_type}")
+        return
+
+    await process_food_entry(message, items, raw_data)
+
+@dp.message(F.text, StateFilter(None))
+async def handle_text(message: types.Message):
+    msg_id = f"{message.chat.id}:{message.message_id}"
+    if msg_id in processed_messages: return
+    processed_messages.add(msg_id)
+    if len(processed_messages) > 1000: processed_messages.clear()
+
+    status_msg = await message.answer("Calculando... 🧐")
+    
+    items, error_type, raw_data = await extract_calories_list(
+        user_id=message.from_user.id, 
+        message_text=message.text
+    )
+    
+    await status_msg.delete()
+    if error_type == "ai_error":
+        await message.answer(f"❌ Erro na IA. Verifique os logs.")
+        return
+    elif error_type == "json_error":
+        await message.answer("❌ Não entendi o formato. Tente simplificar.")
+        return
+        
+    if items is not None and len(items) == 0:
+        await message.answer("🤔 Não identifiquei alimentos.")
+        return
+
+    await process_food_entry(message, items, raw_data)
 
 # --- FastAPI Webhook ---
 

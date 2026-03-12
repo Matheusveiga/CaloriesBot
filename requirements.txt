@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+aiogram
+google-generativeai
+supabase
+python-dotenv
+httpx

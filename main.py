@@ -11,7 +11,7 @@ from aiogram.types import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-import google.generativeai as genai
+from google import genai
 from supabase import create_client, Client
 from dotenv import load_dotenv
 
@@ -52,9 +52,9 @@ bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 app = FastAPI()
 
-# Init Gemini
-genai.configure(api_key=GEMINI_KEY)
-model = genai.GenerativeModel('gemini-1.5-flash')
+# Init Gemini (New SDK)
+ai_client = genai.Client(api_key=GEMINI_KEY)
+AI_MODEL = "gemini-1.5-flash" # Estável e funcional na SDK nova
 
 # Init Supabase
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -155,7 +155,10 @@ async def extract_calories_list(message_text: str):
     """
     raw_text = ""
     try:
-        response = model.generate_content(prompt)
+        response = ai_client.models.generate_content(
+            model=AI_MODEL,
+            contents=prompt
+        )
         raw_text = response.text
         
         # Robust JSON extraction

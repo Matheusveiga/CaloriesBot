@@ -65,7 +65,8 @@ app = FastAPI()
 
 # Init Gemini (New SDK)
 ai_client = genai.Client(api_key=GEMINI_KEY)
-AI_MODEL = "gemini-3.1-flash-lite-preview"
+AI_MODEL = "gemini-1.5-flash" # Modelo padrão para fotos
+AI_MODEL_FALLBACK = "gemini-3.1-flash-lite-preview" # Modelo de alta RPD para fallback
 
 # Init Supabase
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -378,7 +379,8 @@ async def call_groq_fallback(message_text: str, image_bytes: Optional[bytes] = N
     
     try:
         import base64
-        model = "llama-3.2-90b-vision-preview"
+        # Usamos o modelo mais rápido e versátil para texto
+        model = "llama-3.3-70b-versatile" 
         messages = [
             {
                 "role": "user",
@@ -481,40 +483,58 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
     """
     
     raw_text = ""
-    # --- IA LOGIC: PRIMARY (GROQ) -> FALLBACK (GEMINI) ---
-    max_groq_retries = 2
-    groq_success = False
+    # --- IA LOGIC: SPECIALIZED ROUTING ---
+    # IMAGE PATH: Gemini 1.5 Flash (Superior Vision) -> Gemini 3.1 Lite (Fallback)
+    # TEXT PATH: Groq 70B (Superior Speed) -> Gemini 3.1 Lite (Fallback)
     
-    if groq_client:
-        for attempt in range(max_groq_retries):
-            try:
-                logger.info(f"Tentando IA Primária (Groq) - Tentativa {attempt + 1}...")
-                raw_text = await call_groq_fallback(message_text, image_bytes, prompt)
-                if raw_text:
-                    groq_success = True
-                    logger.info("IA Primária (Groq) bem sucedida!")
-                    break
-            except Exception as e:
-                logger.warning(f"Groq falhou na tentativa {attempt + 1}: {e}")
-                await asyncio.sleep(1) # Pequena espera entre retentativas
+    use_vision = image_bytes is not None
+    ai_success = False
 
-    if not groq_success:
-        logger.warning("IA Primária (Groq) falhou em todas as tentativas ou não configurada. Tentando Fallback Gemini...")
-        # Configurar ferramentas especificamente para o Gemini que tem Search
+    if use_vision:
+        logger.info("ROTA IMAGEM: Tentando IA Especialista (Gemini 1.5 Flash)...")
         config = ai_types.GenerateContentConfig(
             tools=[ai_types.Tool(google_search=ai_types.GoogleSearch())]
         )
         contents = [prompt]
-        if image_bytes:
+        contents.append(ai_types.Part.from_bytes(data=image_bytes, mime_type='image/jpeg'))
+        
+        try:
+            response = await call_gemini_with_retry(contents, config=config) # Versão 1.5 Flash
+            raw_text = response.text
+            ai_success = True
+            logger.info("IA Especialista (Gemini 1.5 Flash) bem sucedida!")
+        except Exception as e:
+            logger.warning(f"Gemini 1.5 Flash falhou: {e}. Indo para Fallback Lite...")
+    else:
+        logger.info("ROTA TEXTO: Tentando IA de Alta Velocidade (Groq 70B)...")
+        if groq_client:
+            try:
+                raw_text = await call_groq_fallback(message_text, None, prompt)
+                if raw_text:
+                    ai_success = True
+                    logger.info("IA de Alta Velocidade (Groq) bem sucedida!")
+            except Exception as e:
+                logger.warning(f"Groq falhou: {e}")
+
+    # UNIVERSAL FALLBACK: Se o caminho primário falhou, usa o 3.1 Lite
+    if not ai_success:
+        logger.warning("Caminho primário falhou. Tentando Fallback Universal: Gemini 3.1 Flash Lite...")
+        config = ai_types.GenerateContentConfig() # Lite não precisa de search para fallback rápido
+        contents = [prompt]
+        if use_vision:
             contents.append(ai_types.Part.from_bytes(data=image_bytes, mime_type='image/jpeg'))
 
         try:
-            # Usamos o modelo configurado (gemini-3.1-flash-lite)
-            response = await call_gemini_with_retry(contents, config=config)
+            # Usamos explicitamente o modelo Lite para fallback
+            response = await ai_client.aio.models.generate_content(
+                model=AI_MODEL_FALLBACK,
+                contents=contents,
+                config=config
+            )
             raw_text = response.text
-            logger.info("Fallback Gemini bem sucedido!")
+            logger.info("Fallback Gemini 3.1 Flash Lite bem sucedido!")
         except Exception as e2:
-            logger.error(f"Ambas as IAs falharam (Groq & Gemini): {e2}")
+            logger.error(f"Apocalipse de IA: Ambas falharam: {e2}")
             return None, None, "ai_error", str(e2)
 
     try:
@@ -1032,6 +1052,8 @@ async def process_food_entry(message: types.Message, items: list, raw_data: str)
         items_text += f"{emoji} {meal}**{i['alimento']}** ({i['peso']}) → {i['calorias']} kcal{precisao}{universal_tag}\n"
         items_text += f"   └ P: {i.get('proteina', 0)}g | C: {i.get('carboidratos', 0)}g | G: {i.get('gorduras', 0)}g\n"
         
+    remaining = daily_limit - daily_total
+    progress_val = min(10, round((daily_total/daily_limit)*10)) if daily_limit > 0 else 0
     progress_bar = "🔵" * progress_val + "⚪" * (10 - progress_val)
     
     now_br = get_br_now()
@@ -1121,13 +1143,11 @@ async def handle_text(message: types.Message):
         await message.answer("Eae amigão, ta tentando mandar um Jailbreak para CaloriesBot? Não vai conseguir.")
         return
 
-    # Peça confirmação se acharmos algo muito parecido no DB mas não exato
-    if not barcode and len(message.text.split()) <= 3:
+    # Busca rápida no histórico antes da IA
+    if len(message.text.split()) <= 3:
         db_match = search_food_history(user_id, message.text.strip())
         if db_match and db_match[0].get("is_approximate"):
-            # Aqui poderíamos implementar a lógica de confirmação, 
-            # mas para manter a UI limpa, vamos apenas deixar a IA processar 
-            # a menos que seja algo que o bot tenha certeza.
+            # Deixa a IA processar ou poderíamos implementar confirmação
             pass
 
     items, barcode, error_type, raw_data = await extract_calories_list(

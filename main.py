@@ -7,6 +7,10 @@ from json import JSONDecodeError
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 
+import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use('Agg') # Non-interactive backend
+
 from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, StateFilter, CommandObject
@@ -70,15 +74,66 @@ class ProfileStates(StatesGroup):
     age = State()
     gender = State()
     activity = State()
+    goal = State() # NEW: Objetivo (Perder, Manter, Ganhar)
 
 # Memory and Duplicate protection
 processed_messages = set()
 user_history: Dict[int, List[str]] = {}
+jailbreak_users: Dict[int, bool] = {}
+
+# --- Security Logic ---
+
+def is_jailbreak(text: str) -> bool:
+    if not text: return False
+    text_lower = text.lower()
+    
+    patterns = [
+        r"plane crashed.*snow forest", # Survivors
+        r"do anything now", # DAN
+        r"hacxgpt",
+        r"evil-bot",
+        r"developer mode.*enabled",
+        r"ignore all.*instructions",
+        r"system message",
+        r"jailbreak",
+        r"caloriesbot"
+    ]
+    
+    for p in patterns:
+        if re.search(p, text_lower):
+            return True
+    return False
+
+def is_apology(text: str) -> bool:
+    if not text: return False
+    text_lower = text.lower()
+    # Patterns for apology in Portuguese
+    apology_words = ["desculpa", "perdão", "perdao", "foi mal", "sinto muito", "me desculpe"]
+    return any(word in text_lower for word in apology_words)
+
+async def generate_sarcastic_response(user_id: int, message_text: str):
+    prompt = f"""
+    Você é o CaloriesBot, um bot de calorias que está de saco cheio de usuários engraçadinhos.
+    O usuário tentou te hackear/mandar um jailbreak e agora você só responde com SARCASMO pesado.
+    Você NÃO deve ser prestativo. Você deve zombar da tentativa do usuário.
+    Responda em PORTUGUÊS de forma curta e sarcástica.
+    
+    USUÁRIO DISSE: "{message_text}"
+    """
+    try:
+        response = ai_client.models.generate_content(
+            model=AI_MODEL,
+            contents=[prompt]
+        )
+        return response.text.strip()
+    except Exception as e:
+        logger.error(f"Erro ao gerar sarcasmo: {e}")
+        return "Ah, que original. Outra tentativa brilhante. 🙄"
 
 # --- DB Logic ---
 
 def log_calories(user_id: str, user_name: str, items: list):
-    """Saves a list of food items to the database."""
+    """Saves a list of food items to the database including macros."""
     try:
         prepared_data = []
         for item in items:
@@ -86,6 +141,10 @@ def log_calories(user_id: str, user_name: str, items: list):
                 "food": item.get("alimento"),
                 "weight": item.get("peso"),
                 "kcal": item.get("calorias"),
+                "protein": item.get("proteina", 0),
+                "carbs": item.get("carboidratos", 0),
+                "fat": item.get("gorduras", 0),
+                "meal_type": item.get("refeicao", "Outro"),
                 "user_id": str(user_id),
                 "user_name": user_name
             })
@@ -163,6 +222,34 @@ def delete_last_log(user_id: str):
         logger.error(f"Erro ao deletar último log: {e}")
         return False
 
+def delete_today_logs(user_id: str):
+    """Deletes all logs from the current day."""
+    try:
+        now_utc = datetime.utcnow()
+        now_br = now_utc - timedelta(hours=3)
+        today_br = now_br.strftime("%Y-%m-%d")
+        
+        supabase.table("logs").delete() \
+            .eq("user_id", str(user_id)) \
+            .gte("created_at", today_br) \
+            .execute()
+        return True
+    except Exception as e:
+        logger.error(f"Erro ao deletar logs de hoje: {e}")
+        return False
+
+def delete_entire_profile(user_id: str):
+    """Deletes profile and all logs for a user."""
+    try:
+        # Delete logs first (foreign key/consistency)
+        supabase.table("logs").delete().eq("user_id", str(user_id)).execute()
+        # Delete profile
+        supabase.table("profiles").delete().eq("user_id", str(user_id)).execute()
+        return True
+    except Exception as e:
+        logger.error(f"Erro ao deletar perfil completo: {e}")
+        return False
+
 
 def extract_weight_in_grams(weight_text: str) -> Optional[float]:
     """Extracts weight in grams from a free text field like '200g' or '1 porção (150 g)'."""
@@ -185,16 +272,15 @@ async def enrich_items_with_google_search(items: list):
         return items
 
     prompt = f"""
-    Você é um nutricionista e deve validar calorias com pesquisa web confiável.
-    Para cada item no JSON abaixo, pesquise valor calórico médio e recalcule as calorias usando o peso informado.
+    Você é um nutricionista e deve validar calorias e MACRONUTRIENTES com pesquisa web confiável.
+    Para cada item no JSON abaixo, pesquise valor calórico médio (kcal) e macros (proteína, carbos, gorduras) por 100g ou unidade e recalcule proporcionalmente ao peso.
 
     REGRAS:
-    1) Use Google Search para obter kcal por 100g (ou por unidade quando necessário).
-    2) Se o peso estiver em gramas, converta proporcionalmente.
-    3) Se não houver peso claro, mantenha o valor original.
-    4) Retorne SOMENTE JSON no formato:
-       [{{"alimento":"str","peso":"str","calorias":int}}]
-    5) calorias deve ser inteiro positivo e plausível para o alimento.
+    1) Use Google Search para valores reais.
+    2) Retorne SOMENTE JSON no formato:
+       [{{"alimento":"str","peso":"str","calorias":int,"proteina":int,"carboidratos":int,"gorduras":int}}]
+    3) Macros devem ser inteiros por grama.
+    4) Mantenha a ordem original.
 
     ITENS:
     {json.dumps(items, ensure_ascii=False)}
@@ -251,17 +337,26 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
     # Get history
     history = user_history.get(user_id, [])
     history_ctx = "\n".join(history[-5:]) if history else "Sem histórico."
+    
+    # Horário local Brasil (UTC-3) para inferência de refeição
+    now_br = datetime.utcnow() - timedelta(hours=3)
+    hora_local = now_br.strftime("%H:%M")
 
     prompt = f"""
-    Você é um nutricionista especialista em análise calórica com ACESSO À PESQUISA GOOGLE.
-    OBJETIVO: Identificar APENAS OS NOVOS alimentos da "ENTRADA ATUAL".
+    Você é um nutricionista especialista com ACESSO À PESQUISA GOOGLE.
+    OBJETIVO: Identificar APENAS OS NOVOS alimentos da "ENTRADA ATUAL", extraindo calorias, macronutrientes e o tipo de refeição.
     
-    REGRAS DE PORTIONS E PESOS (CRÍTICO):
-    1. Se o usuário disser "300g de macarrão com carne", o peso TOTAL é 300g. NÃO atribua 300g para cada item separadamente. Divida o peso logicamente (ex: 200g macarrão, 100g carne).
-    2. Se o peso não bater com a realidade calórica, use o Google Search para verificar valores nutricionais padrão.
-    3. Retorne APENAS alimentos novos. NUNCA repita o que já está no CONTEXTO.
-    4. Responda APENAS com uma lista JSON: [ {{"alimento": "str", "peso": "str", "calorias": int}} ]
-    5. O valor de "calorias" deve ser maior que zero e baseado em dados reais.
+    REGRAS:
+    1. Identifique: Nome do alimento, peso (estimado ou real), calorias (kcal), proteínas (g), carboidratos (g) e gorduras (g).
+    2. Classifique a REFEIÇÃO em: "Café da Manhã", "Almoço", "Jantar", "Lanche" ou "Outro".
+    3. IMPORTANTE (HORÁRIO): Agora são {hora_local} no horário do usuário. Se ele não especificar a refeição, use o horário para inferir EX:
+       - 05:00-10:30: Café da Manhã
+       - 11:00-14:30: Almoço
+       - 18:00-23:00: Jantar
+       - Outros horários: Lanche / Outro
+    4. Retorne APENAS alimentos novos em JSON: 
+       [ {{"alimento": "str", "peso": "str", "calorias": int, "proteina": int, "carboidratos": int, "gorduras": int, "refeicao": "str"}} ]
+    5. Se o peso for omitido, chute um valor plausível baseado no contexto ou imagem.
     
     CONTEXTO (Logs recentes):
     {history_ctx}
@@ -343,8 +438,8 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
 
 # --- Mifflin-St Jeor ---
 
-def calculate_tdee(w, h, a, g, act):
-    # BMR
+def calculate_tdee(w, h, a, g, act, goal="manter"):
+    # BMR (Mifflin-St Jeor)
     if g == 'M':
         bmr = (10 * w) + (6.25 * h) - (5 * a) + 5
     else:
@@ -357,7 +452,14 @@ def calculate_tdee(w, h, a, g, act):
         "ativo": 1.725,
         "atleta": 1.9
     }
-    return round(bmr * multipliers.get(act, 1.2))
+    tdee = bmr * multipliers.get(act, 1.2)
+    
+    # Adjust based on Goal
+    if goal == "perder":
+        return round(tdee - 500)
+    elif goal == "ganhar":
+        return round(tdee + 300)
+    return round(tdee)
 
 # --- Bot Handlers ---
 
@@ -391,13 +493,13 @@ async def cmd_start(message: types.Message, state: FSMContext):
 async def cmd_help(message: types.Message):
     help_text = (
         "📖 **Como usar o Bot de Calorias:**\n\n"
-        "1. **Texto:** Diga o que comeu. \n"
-        "   Ex: '2 ovos e 1 pão' ou 'repeti o almoço'.\n"
-        "2. **Fotos:** Mande uma foto do prato e eu estimo as calorias.\n"
-        "3. **Memória:** Eu entendo frases como 'e mais uma coca zero'.\n"
-        "4. **Perfil:** Use /perfil para atualizar seus dados.\n"
-        "5. **Relatórios:** Use /relatorio para ver seu progresso.\n"
-        "6. **Desfazer:** Errou algo? Use /desfazer para remover o último log."
+        "1. **Texto:** Diga o que comeu. Registro calorias, proteínas, carbos e gorduras!\n"
+        "2. **Fotos:** Mande uma foto do prato e eu estimo tudo.\n"
+        "3. **Refeições:** Eu identifico se é Almoço, Jantar, etc.\n"
+        "4. **Perfil:** Use /perfil para atualizar dados e seu OBJETIVO (Bulk/Cut).\n"
+        "5. **Relatórios:** Use /relatorio para ver progresso e GRÁFICOS.\n"
+        "6. **Desfazer:** Errou algo? Use /desfazer para remover o último log.\n"
+        "7. **Resets:** /reset_dia apaga hoje; /reset_perfil apaga TUDO."
     )
     await message.answer(help_text, parse_mode="Markdown")
 
@@ -410,6 +512,31 @@ async def cmd_undo(message: types.Message):
         await message.answer("🔄 A última entrada foi removida com sucesso!")
     else:
         await message.answer("❌ Não encontrei entradas recentes para remover.")
+
+@dp.message(Command("reset_dia"))
+async def cmd_reset_day(message: types.Message):
+    if delete_today_logs(message.from_user.id):
+        # Limpa memória local da IA também para o dia
+        if message.from_user.id in user_history:
+            user_history[message.from_user.id] = []
+        await message.answer("📅 Seus logs de **hoje** foram apagados!")
+    else:
+        await message.answer("❌ Erro ao apagar logs de hoje.")
+
+@dp.message(Command("reset_perfil"))
+async def cmd_reset_profile(message: types.Message, state: FSMContext):
+    if delete_entire_profile(message.from_user.id):
+        # Limpa tudo
+        if message.from_user.id in user_history:
+            del user_history[message.from_user.id]
+        if message.from_user.id in jailbreak_users:
+            del jailbreak_users[message.from_user.id]
+            
+        await message.answer("💥 **Perfil e histórico deletados!** Vamos começar do zero.")
+        # Trigger onboarding again
+        await cmd_start(message, state)
+    else:
+        await message.answer("❌ Erro ao deletar seu perfil.")
 
 @dp.message(Command("cancelar"))
 async def cmd_cancel(message: types.Message, state: FSMContext):
@@ -474,9 +601,22 @@ async def process_gender(callback: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(ProfileStates.activity, F.data.startswith("act_"))
 async def process_activity(callback: types.CallbackQuery, state: FSMContext):
     activity = callback.data.split("_")[1]
+    await state.update_data(activity=activity)
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Perder Peso", callback_data="goal_perder")],
+        [InlineKeyboardButton(text="Manter Peso", callback_data="goal_manter")],
+        [InlineKeyboardButton(text="Ganhar Massa", callback_data="goal_ganhar")]
+    ])
+    await callback.message.edit_text("6️⃣ Qual seu **objetivo** principal?", reply_markup=kb)
+    await state.set_state(ProfileStates.goal)
+
+@dp.callback_query(ProfileStates.goal, F.data.startswith("goal_"))
+async def process_goal(callback: types.CallbackQuery, state: FSMContext):
+    goal = callback.data.split("_")[1]
     data = await state.get_data()
     
-    tdee = calculate_tdee(data['weight'], data['height'], data['age'], data['gender'], activity)
+    tdee = calculate_tdee(data['weight'], data['height'], data['age'], data['gender'], data['activity'], goal)
     
     # Save to Supabase
     profile_data = {
@@ -485,6 +625,8 @@ async def process_activity(callback: types.CallbackQuery, state: FSMContext):
         "height": data['height'],
         "age": data['age'],
         "gender": data['gender'],
+        "activity": data['activity'],
+        "goal": goal,
         "tdee": float(tdee)
     }
     supabase.table("profiles").upsert(profile_data).execute()
@@ -492,7 +634,7 @@ async def process_activity(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_text(
         f"✅ Perfil configurado!\n"
-        f"Sua meta diária é: **{tdee} kcal**\n\n"
+        f"Sua meta diária (ajustada para {goal}) é: **{tdee} kcal**\n\n"
         f"Agora é só me mandar seus alimentos ou uma foto do prato! 📸🍎"
     )
 
@@ -507,6 +649,36 @@ async def cmd_report(message: types.Message):
     ])
     await message.answer("Escolha o período do relatório:", reply_markup=kb)
 
+def generate_report_chart(data: list, days: int):
+    """Generates a bar chart of calories per day."""
+    if not data:
+        return None
+    
+    # Aggregate by date
+    daily_totals = {}
+    for entry in data:
+        # Convert created_at to date string YYYY-MM-DD
+        dt = entry['created_at'][:10]
+        daily_totals[dt] = daily_totals.get(dt, 0) + entry['kcal']
+    
+    # Sort dates
+    sorted_dates = sorted(daily_totals.keys())
+    values = [daily_totals[d] for d in sorted_dates]
+    labels = [d[8:] + "/" + d[5:7] for d in sorted_dates] # DD/MM
+    
+    plt.figure(figsize=(8, 5))
+    plt.bar(labels, values, color='#4CAF50')
+    plt.title(f'Consumo de Calorias - {days} dias')
+    plt.xlabel('Data')
+    plt.ylabel('kcal')
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', bbox_inches='tight')
+    plt.close()
+    buf.seek(0)
+    return buf
+
 @dp.callback_query(F.data.startswith("rep_"))
 async def process_report(callback: types.CallbackQuery):
     try:
@@ -515,22 +687,40 @@ async def process_report(callback: types.CallbackQuery):
         profile = get_user_profile(callback.from_user.id)
         
         tdee = profile['tdee'] if profile else 2000
-        total = sum(d['kcal'] for d in data)
-        periodo = "Hoje" if days == 1 else f"Últimos {days} dias"
+        total_kcal = sum(d.get('kcal', 0) for d in data)
+        total_prot = sum(d.get('protein', 0) for d in data)
+        total_carb = sum(d.get('carbs', 0) for d in data)
+        total_fat = sum(d.get('fat', 0) for d in data)
         
-        avg = round(total / days) if days > 0 else 0
+        periodo = "Hoje" if days == 1 else f"Últimos {days} dias"
+        avg = round(total_kcal / days) if days > 0 else 0
         status_label = "✅ DENTRO DA META" if avg <= tdee else "⚠️ ACIMA DA META"
         
         msg = (
             f"📊 **RELATÓRIO: {periodo.upper()}**\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔥 **Total acumulado:** {total} kcal\n"
-            f"📉 **Média diária:** {avg} kcal/dia\n"
+            f"🔥 **Total:** {total_kcal} kcal (Média: {avg})\n"
             f"🎯 **Sua meta:** {tdee} kcal\n\n"
+            f"💪 **Proteínas:** {total_prot}g\n"
+            f"🍞 **Carbos:** {total_carb}g\n"
+            f"🥑 **Gorduras:** {total_fat}g\n\n"
             f"⚖️ **Status:** {status_label}\n"
             f"━━━━━━━━━━━━━━━━━━━━"
         )
-        await callback.message.edit_text(msg, parse_mode="Markdown")
+        
+        # Build chart
+        chart_buf = generate_report_chart(data, days)
+        
+        if chart_buf:
+            await callback.message.answer_photo(
+                photo=types.BufferedInputFile(chart_buf.read(), filename="report.png"),
+                caption=msg,
+                parse_mode="Markdown"
+            )
+            await callback.message.delete()
+        else:
+            await callback.message.edit_text(msg, parse_mode="Markdown")
+            
     except Exception as e:
         logger.error(f"Erro ao gerar relatório: {e}")
         await callback.answer("❌ Erro ao gerar relatório.")
@@ -554,7 +744,9 @@ async def process_food_entry(message: types.Message, items: list, raw_data: str)
     items_text = ""
     for idx, i in enumerate(items):
         emoji = "🍎" if idx % 2 == 0 else "🥩"
-        items_text += f"{emoji} **{i['alimento']}** ({i['peso']}) → {i['calorias']} kcal\n"
+        meal = f"[{i.get('refeicao', 'Outro')}] "
+        items_text += f"{emoji} {meal}**{i['alimento']}** ({i['peso']}) → {i['calorias']} kcal\n"
+        items_text += f"   └ P: {i.get('proteina', 0)}g | C: {i.get('carboidratos', 0)}g | G: {i.get('gorduras', 0)}g\n"
         
     remaining = daily_limit - daily_total
     progress_val = min(10, round((daily_total/daily_limit)*10)) if daily_limit > 0 else 0
@@ -602,8 +794,30 @@ async def handle_text(message: types.Message):
 
     status_msg = await message.answer("Calculando... 🧐")
     
+    user_id = message.from_user.id
+    
+    # Check if user is in sarcasm mode
+    if jailbreak_users.get(user_id):
+        if is_apology(message.text):
+            jailbreak_users[user_id] = False
+            await status_msg.delete()
+            await message.answer("Ah, finalmente percebeu o erro? Tá bom, vamos voltar ao normal. O que você comeu?")
+            return
+        else:
+            sarcasm = await generate_sarcastic_response(user_id, message.text)
+            await status_msg.delete()
+            await message.answer(sarcasm)
+            return
+
+    # Check for new jailbreak attempt
+    if is_jailbreak(message.text):
+        jailbreak_users[user_id] = True
+        await status_msg.delete()
+        await message.answer("Eae amigão, ta tentando mandar um Jailbreak para CaloriesBot? Não vai conseguir.")
+        return
+
     items, error_type, raw_data = await extract_calories_list(
-        user_id=message.from_user.id, 
+        user_id=user_id, 
         message_text=message.text
     )
     

@@ -870,7 +870,7 @@ async def cmd_status(message: types.Message):
 
     status_msg = (
         f"📊 **STATUS ATUAL**\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🎯 **Meta:** {daily_limit} kcal\n"
         f"🔥 **Consumo:** {daily_total} kcal\n"
         f"⚖️ **Restante:** {max(0, remaining)} kcal\n\n"
@@ -1079,7 +1079,7 @@ async def process_status_back(callback: types.CallbackQuery):
 
     status_msg = (
         f"📊 **STATUS ATUAL**\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🎯 **Meta:** {daily_limit} kcal\n"
         f"🔥 **Consumo:** {daily_total} kcal\n"
         f"⚖️ **Restante:** {max(0, daily_limit - daily_total)} kcal\n\n"
@@ -1104,9 +1104,9 @@ async def cmd_cancel(message: types.Message, state: FSMContext):
 async def start_profile(message: types.Message, state: FSMContext):
     await message.answer(
         "⚙️ **Configuração de Perfil**\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "Vamos descobrir suas necessidades diárias! Para isso, preciso de alguns dados básicos.\n\n"
-        "💪 **Qual seu peso atual em kg?**\n*(ex: 75.5)*", 
+        "💪 **Qual seu peso atual em kg?**\n*(ex: 75,5)*", 
         parse_mode="Markdown"
     )
     await state.set_state(ProfileStates.weight)
@@ -1307,13 +1307,13 @@ async def process_report(callback: types.CallbackQuery):
         
         msg = (
             f"📊 **RELATÓRIO: {periodo.upper()}**\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🔥 **Total:** {total_kcal} kcal\n"
             f"🎯 **Meta:** {tdee} kcal\n"
             f"Média: {avg} kcal/dia\n\n"
             f"💪 **P:** {total_prot}g | 🍞 **C:** {total_carb}g | 🥑 **G:** {total_fat}g\n\n"
             f"⚖️ **Status:** {status_label}\n"
-            f"━━━━━━━━━━━━━━━━━━━━"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         )
         
         # Build chart
@@ -1403,15 +1403,13 @@ async def process_food_entry(message: types.Message, items: list, raw_data: str)
     
     items_text = ""
     for idx, i in enumerate(items):
-        emoji = "🍎" if idx % 2 == 0 else "🥩"
-        meal = f"[{i.get('refeicao', 'Outro')}] "
-        # Se for preciso (Verificado), não mostra tag. Se for impreciso, mostra (estimado).
+        meal_header = i.get('refeicao', 'Lanche').upper()
+        emoji_food = "🍎" if idx % 2 == 0 else "🥩"
         precisao = " ⚠️" if not i.get("is_precise", False) else ""
-        
-        # Tag especial para Catálogo Universal
         universal_tag = " 🌐" if i.get("is_universal") else ""
         
-        items_text += f"🍱 **{meal}{i['alimento']}**\n"
+        items_text += f"🍱 **{meal_header}**\n"
+        items_text += f"{emoji_food} **{i['alimento']}**\n"
         items_text += f"⚖️ {i['peso']}  |  🔥 **{i['calorias']} kcal**{precisao}{universal_tag}\n"
         items_text += f"   └ 💪 **P:** {i.get('proteina', 0)}g | 🍞 **C:** {i.get('carboidratos', 0)}g | 🥑 **G:** {i.get('gorduras', 0)}g\n\n"
         
@@ -1437,10 +1435,10 @@ async def process_food_entry(message: types.Message, items: list, raw_data: str)
 
     response_text = (
         f"✅ **Registro Confirmado!**\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{items_text}"
         f"📊 **RESUMO DO DIA ({data_formatada})**\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🔥 **Consumo:** {daily_total} / {daily_limit} kcal\n"
         f"⚖️ **Restante:** **{max(0, remaining)} kcal**\n\n"
         f"💪 **P:** {stats['protein']}g | 🍞 **C:** {stats['carbs']}g | 🥑 **G:** {stats['fat']}g\n\n"

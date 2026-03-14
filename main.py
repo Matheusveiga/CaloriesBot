@@ -66,7 +66,7 @@ app = FastAPI()
 
 # Init Gemini (New SDK)
 ai_client = genai.Client(api_key=GEMINI_KEY)
-AI_MODEL = "gemini-1.5-flash" # Modelo padrão para fotos
+AI_MODEL = "gemini-2.0-flash" # Modelo primário (Visão/Texto em 2026)
 AI_MODEL_FALLBACK = "gemini-3.1-flash-lite-preview" # Modelo de alta RPD para fallback
 
 # Init Supabase
@@ -267,6 +267,15 @@ def delete_entire_profile(user_id: str):
         logger.error(f"Erro ao deletar perfil completo: {e}")
         return False
 
+def delete_log_by_id(user_id: str, log_id: int):
+    """Deletes a specific log entry by its ID."""
+    try:
+        supabase.table("logs").delete().eq("user_id", str(user_id)).eq("id", log_id).execute()
+        return True
+    except Exception as e:
+        logger.error(f"Erro ao deletar log por ID: {e}")
+        return False
+
 def search_food_history(user_id: str, food_query: str):
     """
     Searches for a historical log entry that matches the message text exactly.
@@ -434,7 +443,7 @@ async def get_barcode_data(barcode: str):
 async def extract_calories_list(user_id: int, message_text: str = "", image_bytes: Optional[bytes] = None):
     """
     Calls Gemini to extract food items from text or image. 
-    Returns (items_list, error_type, raw_response)
+    Returns (items_list, barcode, is_packaged, error_type, raw_response)
     """
     # Get history
     history = user_history.get(user_id, [])
@@ -472,13 +481,15 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
     OBJETIVO: Identificar APENAS OS NOVOS alimentos da "ENTRADA ATUAL", extraindo calorias, macronutrientes e o tipo de refeição.
     
     REGRAS DE PESQUISA:
-    1. PRIORIZE encontrar a TABELA NUTRICIONAL oficial (TACO/USDA ou fabricante).
-    2. Identifique: Nome, peso, calorias (kcal), proteínas (g), carbos (g) e gorduras (g).
-    3. Classifique a REFEIÇÃO ({hora_local}: 05-10:30 Café, 11-14:30 Almoço, 18-23 Jantar, outros: Lanche).
-    4. **CÓDIGO DE BARRAS:** Se a imagem contiver um código de barras visível (EAN-13, etc), extraia os números no campo `barcode` (sem espaços).
-    5. Retorne JSON: 
-       {{ "items": [ {{"alimento": "str", "peso": "str", "calorias": int, "proteina": int, "carboidratos": int, "gorduras": int, "refeicao": "str", "is_precise": bool}} ], "barcode": "string_or_null" }}
-    6. Campo `is_precise`: `true` se a marca/tipo for identificado; `false` se for estimativa genérica.
+    1. **TABELA NUTRICIONAL:** Se houver uma tabela nutricional ou lista de ingredientes visível na imagem, EXTRAIA os valores exatos nela descritos. Isso é prioridade máxima.
+    2. **PRIORIDADE SECUNDÁRIA:** Se não houver tabela visível, use bases oficiais (TACO/IBGE/USDA).
+    3. Identifique: Nome, peso, calorias (kcal), proteínas (g), carbos (g) e gorduras (g).
+    4. Classifique a REFEIÇÃO ({hora_local}: 05-10:30 Café, 11-14:30 Almoço, 18-23 Jantar, outros: Lanche).
+    5. **CÓDIGO DE BARRAS:** Se a imagem contiver um código de barras visível (EAN-13, etc), extraia os números no campo `barcode` (sem espaços).
+    6. Retorne JSON: 
+       {{ "items": [ {{"alimento": "str", "peso": "str", "calorias": int, "proteina": int, "carboidratos": int, "gorduras": int, "refeicao": "str", "is_precise": bool}} ], "barcode": "string_or_null", "is_packaged": bool }}
+    7. Campo `is_packaged`: `true` se for um produto industrializado individual (com embalagem/tabela); `false` se for um prato pronto ou refeição caseira.
+    8. Campo `is_precise`: `true` se a marca/tipo for identificado; `false` se for estimativa genérica.
     
     CONTEXTO: {history_ctx}
     ENTRADA ATUAL: "{message_text}"
@@ -537,7 +548,7 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
             logger.info("Fallback Gemini 3.1 Flash Lite bem sucedido!")
         except Exception as e2:
             logger.error(f"Apocalipse de IA: Ambas falharam: {e2}")
-            return None, None, "ai_error", str(e2)
+            return None, None, False, "ai_error", str(e2)
 
     try:
         # Robust JSON extraction
@@ -550,6 +561,7 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
         result_json = json.loads(cleaned_text.strip())
         items = result_json.get("items", [])
         barcode = result_json.get("barcode")
+        is_packaged = result_json.get("is_packaged", False)
         
         # Sanitize and force types
         sanitized_items = []
@@ -587,13 +599,13 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
         if not image_bytes and final_items:
             AI_CACHE[cache_key] = final_items
 
-        return final_items, barcode, None, raw_text
+        return final_items, barcode, is_packaged, None, raw_text
     except JSONDecodeError as e:
         logger.error(f"Erro ao decodificar JSON da IA: {e}")
-        return None, None, "json_error", raw_text
+        return None, None, False, "json_error", raw_text
     except Exception as e:
         logger.error(f"Gemini error: {e}")
-        return None, None, "ai_error", str(e)
+        return None, None, False, "ai_error", str(e)
 
 # --- Mifflin-St Jeor ---
 
@@ -711,12 +723,20 @@ async def cmd_status(message: types.Message):
     daily_total = get_daily_total(user_id)
     remaining = daily_limit - daily_total
     
-    # Get current meal data for macros breakdown
+    # Get current meal data for list and macros breakdown
     today_br_start = get_br_today_start()
     now_br = get_br_now()
     data_formatada = now_br.strftime("%d/%m/%Y %H:%M")
     
-    res = supabase.table("logs").select("protein, carbs, fat").eq("user_id", str(user_id)).gte("created_at", today_br_start).execute()
+    res = supabase.table("logs").select("*").eq("user_id", str(user_id)).gte("created_at", today_br_start).order("created_at", desc=True).execute()
+    
+    items_list_text = ""
+    for item in res.data:
+        items_list_text += f"• {item['food']} ({item['kcal']} kcal)\n"
+    
+    if not items_list_text:
+        items_list_text = "Nenhum alimento logado hoje.\n"
+
     total_prot = sum(item.get('protein', 0) for item in res.data)
     total_carb = sum(item.get('carbs', 0) for item in res.data)
     total_fat = sum(item.get('fat', 0) for item in res.data)
@@ -730,9 +750,8 @@ async def cmd_status(message: types.Message):
         f"🔥 Meta: **{daily_limit} kcal**\n"
         f"✅ Consumido: **{daily_total} kcal**\n"
         f"⚖️ Restante: **{max(0, remaining)} kcal**\n\n"
-        f"💪 Proteínas: {total_prot}g\n"
-        f"🍞 Carbos: {total_carb}g\n"
-        f"🥑 Gorduras: {total_fat}g\n\n"
+        f"📝 **Itens de hoje:**\n{items_list_text}\n"
+        f"💪 Proteínas: {total_prot}g | 🍞 Carbos: {total_carb}g | 🥑 Gorduras: {total_fat}g\n\n"
         f"{progress_bar}\n"
         f"━━━━━━━━━━━━━━━\n"
     )
@@ -744,7 +763,11 @@ async def cmd_status(message: types.Message):
     else:
         status_msg += "🟢 No caminho certo!"
 
-    await message.answer(status_msg, parse_mode="Markdown")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑️ Desfazer Item Específico", callback_data="list_undo")]
+    ])
+
+    await message.answer(status_msg, parse_mode="Markdown", reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("adj_"))
 async def process_adjustment(callback: types.CallbackQuery):
@@ -800,6 +823,84 @@ async def process_adjustment(callback: types.CallbackQuery):
     except Exception as e:
         logger.error(f"Erro ao ajustar calorias: {e}")
         await callback.answer("❌ Erro no ajuste.")
+
+@dp.callback_query(F.data == "list_undo")
+async def process_list_undo(callback: types.CallbackQuery):
+    """Shows a list of today's items to delete."""
+    user_id = callback.from_user.id
+    today_br_start = get_br_today_start()
+    
+    res = supabase.table("logs") \
+        .select("id, food, kcal") \
+        .eq("user_id", str(user_id)) \
+        .gte("created_at", today_br_start) \
+        .order("created_at", desc=True) \
+        .execute()
+    
+    if not res.data:
+        await callback.answer("❌ Nenhum item para deletar hoje.")
+        return
+
+    buttons = []
+    for item in res.data:
+        # Label encurtada para caber no botão
+        label = f"🗑️ {item['food'][:15]}... ({item['kcal']} kcal)"
+        buttons.append([InlineKeyboardButton(text=label, callback_data=f"del_{item['id']}")])
+    
+    buttons.append([InlineKeyboardButton(text="⬅️ Voltar", callback_data="status_back")])
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    
+    await callback.message.edit_text("Selecione o item que deseja **remover**:", reply_markup=kb, parse_mode="Markdown")
+
+@dp.callback_query(F.data.startswith("del_"))
+async def process_delete_specific(callback: types.CallbackQuery):
+    """Deletes a specific log item."""
+    user_id = callback.from_user.id
+    log_id = int(callback.data.split("_")[1])
+    
+    if delete_log_by_id(user_id, log_id):
+        await callback.answer("✅ Item removido!")
+        # Atualiza a lista (volta para o status ou mostra lista de novo)
+        await process_list_undo(callback)
+    else:
+        await callback.answer("❌ Erro ao deletar.")
+
+@dp.callback_query(F.data == "status_back")
+async def process_status_back(callback: types.CallbackQuery):
+    """Returns to the main status view."""
+    # Simula o comando /status editando a mensagem atual
+    # Precisamos de um profile para o cálculo
+    user_id = callback.from_user.id
+    profile = get_user_profile(user_id)
+    if not profile: return
+    
+    daily_limit = profile['tdee']
+    daily_total = get_daily_total(user_id)
+    remaining = daily_limit - daily_total
+    today_br_start = get_br_today_start()
+    res = supabase.table("logs").select("*").eq("user_id", str(user_id)).gte("created_at", today_br_start).order("created_at", desc=True).execute()
+    
+    items_list_text = "".join([f"• {item['food']} ({item['kcal']} kcal)\n" for item in res.data]) or "Nenhum lanche logado.\n"
+    total_prot = sum(item.get('protein', 0) for item in res.data)
+    total_carb = sum(item.get('carbs', 0) for item in res.data)
+    total_fat = sum(item.get('fat', 0) for item in res.data)
+    progress_val = min(10, round((daily_total/daily_limit)*10)) if daily_limit > 0 else 0
+    progress_bar = "🔵" * progress_val + "⚪" * (10 - progress_val)
+
+    status_msg = (
+        f"📊 **STATUS ATUAL**\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"🔥 Meta: **{daily_limit} kcal**\n"
+        f"✅ Consumido: **{daily_total} kcal**\n\n"
+        f"📝 **Itens de hoje:**\n{items_list_text}\n"
+        f"💪 P: {total_prot}g | 🍞 C: {total_carb}g | 🥑 G: {total_fat}g\n\n"
+        f"{progress_bar}\n"
+    )
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑️ Desfazer Item Específico", callback_data="list_undo")]
+    ])
+    await callback.message.edit_text(status_msg, parse_mode="Markdown", reply_markup=kb)
 
 @dp.message(Command("cancelar"))
 async def cmd_cancel(message: types.Message, state: FSMContext):
@@ -1089,7 +1190,7 @@ async def handle_photo(message: types.Message, state: FSMContext):
         photo_bytes = io.BytesIO()
         await bot.download_file(file.file_path, destination=photo_bytes)
         
-        items, barcode, error_type, raw_data = await extract_calories_list(
+        items, barcode, is_packaged, error_type, raw_data = await extract_calories_list(
             user_id=message.from_user.id,
             image_bytes=photo_bytes.getvalue(),
             message_text=message.caption or "Foto de comida"
@@ -1100,20 +1201,45 @@ async def handle_photo(message: types.Message, state: FSMContext):
             await message.answer(f"❌ Erro na análise da foto: {error_type}")
             return
 
-        # Se detectou código de barras, busca no OpenFoodFacts
+        # ROTA 1: Código de Barras (Zera tudo e usa base oficial)
         if barcode and str(barcode).strip() and str(barcode).strip().lower() != "null":
             product_data = await get_barcode_data(barcode)
             if product_data:
                 await state.update_data(barcode_product=product_data)
                 await message.answer(
-                    f"🔍 **Produto Detectado:** {product_data['alimento']}\n\n"
-                    "Quanto você consumiu deste produto? (ex: 100g, 50, 2 unidades)",
+                    f"🔍 **Produto Detectado (Barcode):** {product_data['alimento']}\n\n"
+                    "Quanto você consumiu deste produto? (ex: 100g, 50, 1 unidade)",
                     parse_mode="Markdown"
                 )
                 await state.set_state(BarcodeState.waiting_for_portion)
                 return
             else:
-                logger.warning(f"Barcode {barcode} detectado mas não encontrado no OpenFoodFacts.")
+                logger.warning(f"Barcode {barcode} não encontrado. Seguindo para análise visual.")
+
+        # ROTA 2: Produto Industrializado Sem Barcode (IA identificou como embalagem)
+        if is_packaged and items:
+            # Transformamos o item da IA em um 'barcode_product' fake para reutilizar o flow de porção
+            # mas baseamos nos valores que a IA leu da TABELA NUTRICIONAL (que agora é prioridade)
+            main_item = items[0]
+            # Convertemos para base 100g para o calculador funcionar
+            weight_val = extract_weight_in_grams(main_item.get("peso", "100g")) or 100
+            factor = 100 / weight_val
+            
+            product_data = {
+                "alimento": main_item["alimento"],
+                "kcal_100g": main_item["calorias"] * factor,
+                "prot_100g": main_item.get("proteina", 0) * factor,
+                "carb_100g": main_item.get("carboidratos", 0) * factor,
+                "fat_100g": main_item.get("gorduras", 0) * factor
+            }
+            await state.update_data(barcode_product=product_data)
+            await message.answer(
+                f"📦 **Embalagem Detectada:** {main_item['alimento']}\n\n"
+                "Para ser mais preciso, quanto você consumiu? (ex: 100g, 1 copo, 200ml)",
+                parse_mode="Markdown"
+            )
+            await state.set_state(BarcodeState.waiting_for_portion)
+            return
 
         await process_food_entry(message, items, raw_data)
     except Exception as e:
@@ -1159,7 +1285,7 @@ async def handle_text(message: types.Message):
                 # Deixa a IA processar ou poderíamos implementar confirmação
                 pass
 
-        items, barcode, error_type, raw_data = await extract_calories_list(
+        items, barcode, is_packaged, error_type, raw_data = await extract_calories_list(
             user_id=user_id, 
             message_text=message.text
         )

@@ -65,7 +65,7 @@ app = FastAPI()
 
 # Init Gemini (New SDK)
 ai_client = genai.Client(api_key=GEMINI_KEY)
-AI_MODEL = "gemini-3.1-flash-lite"
+AI_MODEL = "gemini-3.1-flash-lite-preview"
 
 # Init Supabase
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -378,7 +378,7 @@ async def call_groq_fallback(message_text: str, image_bytes: Optional[bytes] = N
     
     try:
         import base64
-        model = "llama-3.2-11b-vision-preview"
+        model = "llama-3.2-90b-vision-preview"
         messages = [
             {
                 "role": "user",

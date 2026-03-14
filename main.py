@@ -17,7 +17,7 @@ matplotlib.use('Agg') # Non-interactive backend
 from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, StateFilter, CommandObject
-from aiogram.types import Update, InlineKeyboardMarkup, InlineKeyboardButton, PhotoSize
+from aiogram.types import Update, InlineKeyboardMarkup, InlineKeyboardButton, PhotoSize, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -67,6 +67,14 @@ app = FastAPI()
 
 # Init Gemini (New SDK)
 ai_client = genai.Client(api_key=GEMINI_KEY)
+
+def get_main_keyboard():
+    """Returns a persistent ReplyKeyboardMarkup for main navigation."""
+    kb = [
+        [KeyboardButton(text="📊 Status"), KeyboardButton(text="🍱 Logar Comida")],
+        [KeyboardButton(text="📈 Relatório"), KeyboardButton(text="⚙️ Perfil")]
+    ]
+    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True, persistent=True)
 
 async def get_embedding(text: str):
     """Generates a vector embedding for a piece of text using Gemini."""
@@ -182,6 +190,7 @@ def log_calories(user_id: str, user_name: str, items: list):
                 "fat": item.get("gorduras", 0),
                 "meal_type": item.get("refeicao", "Outro"),
                 "is_precise": item.get("is_precise", False),
+                "confirmations": 0, # Novo campo para crowdsourcing
                 "user_id": str(user_id),
                 "user_name": user_name
             })
@@ -201,20 +210,35 @@ def get_user_profile(user_id: str):
         logger.error(f"Erro ao buscar perfil: {e}")
         return None
 
-def get_daily_total(user_id: str):
-    """Calculates the total calories for the current day using Brazil Time (UTC-3)."""
+def get_daily_stats(user_id: str):
+    """Calculates total calories and macros for the current day."""
     try:
         today_br_start = get_br_today_start()
         
         response = supabase.table("logs") \
-            .select("kcal") \
+            .select("kcal, protein, carbs, fat") \
             .eq("user_id", str(user_id)) \
             .gte("created_at", today_br_start) \
             .execute()
-        return sum(item.get('kcal', 0) for item in response.data)
+            
+        total_kcal = sum(item.get('kcal', 0) for item in response.data)
+        total_prot = sum(item.get('protein', 0) for item in response.data)
+        total_carb = sum(item.get('carbs', 0) for item in response.data)
+        total_fat = sum(item.get('fat', 0) for item in response.data)
+        
+        return {
+            "kcal": total_kcal,
+            "protein": total_prot,
+            "carbs": total_carb,
+            "fat": total_fat
+        }
     except Exception as e:
-        logger.error(f"Erro ao calcular total diário: {e}")
-        return 0
+        logger.error(f"Erro ao calcular estatísticas diárias: {e}")
+        return {"kcal": 0, "protein": 0, "carbs": 0, "fat": 0}
+
+def get_daily_total(user_id: str):
+    """Legacy helper: returns only kcal."""
+    return get_daily_stats(user_id)["kcal"]
 
 def get_report_data(user_id: str, days: int):
     """Aggregates data for periodic reports."""
@@ -329,10 +353,11 @@ def search_food_history(user_id: str, food_query: str):
         # PASSO 2: Se não achou NADA pessoal, busca no catálogo GLOBAL por itens VERIFICADOS
         is_universal = False
         if not res.data:
+            # Itens universais: Marcados como precisos OU com muitas confirmações da comunidade
             res = supabase.table("logs") \
-                .select("food, weight, kcal, protein, carbs, fat, meal_type, is_precise") \
-                .eq("is_precise", True) \
+                .select("food, weight, kcal, protein, carbs, fat, meal_type, is_precise, confirmations") \
                 .ilike("food", f"{food_query}") \
+                .or_("is_precise.eq.true,confirmations.gte.5") \
                 .order("created_at", desc=True) \
                 .limit(1) \
                 .execute()
@@ -535,7 +560,7 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
                         "carboidratos": item["carbs"],
                         "gorduras": item["fat"],
                         "refeicao": item["meal_type"],
-                        "is_precise": True
+                        "is_precise": item["is_precise"] # Mantém a precisão original
                     }]
                     return db_match, None, None, None, "SEMANTIC_CACHE"
             except Exception as e:
@@ -728,23 +753,22 @@ async def cmd_start(message: types.Message, state: FSMContext):
     
     if not profile:
         await message.answer(
-            f"👋 Olá, **{message.from_user.first_name}**! Bem-vindo ao Bot de Calorias.\n\n"
-            "Ainda não te conheço! Para calcular suas metas personalizadas, "
-            "precisamos configurar seu perfil (é rapidinho).",
+            f"👋 Olá, **{message.from_user.first_name}**! Prazer em te conhecer. 😊\n\n"
+            "Eu sou o seu assistente de calorias inteligente! Vou te ajudar a trackear sua dieta de forma simples, usando apenas fotos ou mensagens de texto.\n\n"
+            "🚀 **Vamos começar?** Para eu calcular suas metas ideais, preciso criar o seu perfil. É super rápido!",
             parse_mode="Markdown"
         )
-        await message.answer("1️⃣ Qual seu **peso** atual em kg? (ex: `75.5`)", parse_mode="Markdown")
+        await asyncio.sleep(1) # Pequena pausa para leitura
+        await message.answer("⚖️ Primeiro, qual seu **peso** atual em kg?\n*(ex: 75.5)*", parse_mode="Markdown")
         await state.set_state(ProfileStates.weight)
     else:
         await message.answer(
-            f"👋 Olá de novo, **{message.from_user.first_name}**!\n\n"
-            f"🎯 Sua meta atual: **{profile['tdee']} kcal**\n\n"
-            "Escolha uma opção:\n"
-            "🔹 /relatorio - Ver estatísticas\n"
-            "🔹 /perfil - Recalcular meta\n"
-            "🔹 /ajuda - Como usar o bot\n\n"
-            "DICA: Você pode me mandar **fotos** da sua comida! 📸",
-            parse_mode="Markdown"
+            f"👋 Bem-vindo de volta, **{message.from_user.first_name}**!\n\n"
+            f"🎯 Sua meta: **{profile['tdee']} kcal**\n"
+            f"💪 Foco: **{profile['goal'].capitalize()}**\n\n"
+            "O que vamos registrar agora? Você pode me mandar uma **foto** 📸 ou descrever sua refeição por **texto** 📝.",
+            parse_mode="Markdown",
+            reply_markup=get_main_keyboard()
         )
 
 @dp.message(Command("ajuda"))
@@ -803,18 +827,15 @@ async def cmd_status(message: types.Message):
     profile = get_user_profile(user_id)
     
     if not profile:
-        await message.answer("⚠️ **Você ainda não configurou seu perfil.** Use /start para começar!", parse_mode="Markdown")
+        await message.answer("⚠️ **Ops!** Você ainda não tem um perfil configurado.\nClique em **⚙️ Perfil** ou use /perfil para começar!", parse_mode="Markdown", reply_markup=get_main_keyboard())
         return
         
+    stats = get_daily_stats(user_id)
+    daily_total = stats["kcal"]
     daily_limit = profile['tdee']
-    daily_total = get_daily_total(user_id)
     remaining = daily_limit - daily_total
     
-    # Get current meal data for list and macros breakdown
     today_br_start = get_br_today_start()
-    now_br = get_br_now()
-    data_formatada = now_br.strftime("%d/%m/%Y %H:%M")
-    
     res = supabase.table("logs").select("*").eq("user_id", str(user_id)).gte("created_at", today_br_start).order("created_at", desc=True).execute()
     
     items_list_text = ""
@@ -824,37 +845,42 @@ async def cmd_status(message: types.Message):
     if not items_list_text:
         items_list_text = "_Nenhum alimento logado hoje._\n"
 
-    total_prot = sum(item.get('protein', 0) for item in res.data)
-    total_carb = sum(item.get('carbs', 0) for item in res.data)
-    total_fat = sum(item.get('fat', 0) for item in res.data)
-
     progress_val = min(10, round((daily_total/daily_limit)*10)) if daily_limit > 0 else 0
     progress_bar = "🔵" * progress_val + "⚪" * (10 - progress_val)
 
     status_msg = (
-        f"📊 **STATUS ATUAL ({data_formatada})**\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"🎯 Meta: **{daily_limit} kcal**\n"
-        f"🔥 Consumido: **{daily_total} kcal**\n"
-        f"⚖️ Restante: **{max(0, remaining)} kcal**\n\n"
+        f"📊 **STATUS ATUAL**\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 **Meta:** {daily_limit} kcal\n"
+        f"🔥 **Consumo:** {daily_total} kcal\n"
+        f"⚖️ **Restante:** {max(0, remaining)} kcal\n\n"
         f"📝 **Itens de hoje:**\n{items_list_text}\n"
-        f"💪 **P:** {total_prot}g | 🍞 **C:** {total_carb}g | 🥑 **G:** {total_fat}g\n\n"
-        f"{progress_bar}\n"
-        f"━━━━━━━━━━━━━━━\n"
+        f"💪 **P:** {stats['protein']}g | 🍞 **C:** {stats['carbs']}g | 🥑 **G:** {stats['fat']}g\n\n"
+        f"|{progress_bar}|"
     )
     
-    if remaining < 0:
-        status_msg += "⚠️ Você ultrapassou a meta de hoje!"
-    elif remaining < 200:
-        status_msg += "🟡 Quase lá! Cuidado com o próximo lanche."
-    else:
-        status_msg += "🟢 No caminho certo!"
-
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🗑️ Desfazer Item Específico", callback_data="list_undo")]
+        [InlineKeyboardButton(text="🗑️ Deletar Item Específico", callback_data="list_undo")]
     ])
 
     await message.answer(status_msg, parse_mode="Markdown", reply_markup=kb)
+
+# --- Keyboard Button Handlers ---
+@dp.message(F.text == "📊 Status")
+async def btn_status(message: types.Message):
+    await cmd_status(message)
+
+@dp.message(F.text == "🍱 Logar Comida")
+async def btn_log(message: types.Message):
+    await message.answer("Pode mandar! Descreva o que você comeu ou envie uma foto. 📸🥗", parse_mode="Markdown")
+
+@dp.message(F.text == "📈 Relatório")
+async def btn_report(message: types.Message):
+    await cmd_report(message)
+
+@dp.message(F.text == "⚙️ Perfil")
+async def btn_profile(message: types.Message, state: FSMContext):
+    await start_profile(message, state)
 
 @dp.callback_query(F.data.startswith("adj_"))
 async def process_adjustment(callback: types.CallbackQuery):
@@ -952,6 +978,63 @@ async def process_delete_specific(callback: types.CallbackQuery):
     else:
         await callback.answer("❌ Erro ao deletar.")
 
+@dp.callback_query(F.data == "confirm_precise")
+async def process_confirm_precise(callback: types.CallbackQuery):
+    """Increments the confirmation counter for the latest entry."""
+    user_id = callback.from_user.id
+    try:
+        # Get the latest entry
+        res = supabase.table("logs") \
+            .select("id, confirmations") \
+            .eq("user_id", str(user_id)) \
+            .order("created_at", desc=True) \
+            .limit(1) \
+            .execute()
+        
+        if not res.data:
+            await callback.answer("❌ Nenhum log encontrado.")
+            return
+
+        last_id = res.data[0]['id']
+        current_conf = res.data[0].get('confirmations', 0)
+        
+        # Increment confirmations
+        supabase.table("logs").update({"confirmations": current_conf + 1}) \
+            .eq("id", last_id) \
+            .execute()
+            
+        await callback.answer("🗳️ Voto registrado! Obrigado por ajudar a comunidade.")
+        
+        # Remove o botão da mensagem original
+        new_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ 10%", callback_data="adj_1.1"),
+             InlineKeyboardButton(text="➖ 10%", callback_data="adj_0.9")],
+            [InlineKeyboardButton(text="🔄 Desfazer", callback_data="adj_undo")]
+        ])
+        await callback.message.edit_reply_markup(reply_markup=new_kb)
+        
+    except Exception as e:
+        logger.error(f"Erro ao votar precisão: {e}")
+        await callback.answer("❌ Erro ao processar voto.")
+
+@dp.callback_query(F.data.startswith("err_"))
+async def process_error_actions(callback: types.CallbackQuery):
+    action = callback.data.split("_")[1]
+    if action == "text":
+        await callback.message.answer("Pode digitar! Estou pronto para processar seu texto. 📝")
+    elif action == "photo":
+        await callback.message.answer("Mande a foto! Vou tentar analisar aqui. 📸")
+    elif action == "examples":
+        examples = (
+            "📖 **Dicas para o registro:**\n\n"
+            "✅ **Certo:** 'Arroz 100g, feijão 1 concha, 1 bife de frango'\n"
+            "✅ **Certo:** 'Mande uma foto clara do seu prato de cima'\n"
+            "❌ **Errado:** 'Comi muito no almoço hoje'\n\n"
+            "Quanto mais específico você for (gramas, unidades, colheres), melhor eu calculo!"
+        )
+        await callback.message.answer(examples, parse_mode="Markdown")
+    await callback.answer()
+
 @dp.callback_query(F.data == "status_back")
 async def process_status_back(callback: types.CallbackQuery):
     """Returns to the main status view."""
@@ -976,16 +1059,17 @@ async def process_status_back(callback: types.CallbackQuery):
 
     status_msg = (
         f"📊 **STATUS ATUAL**\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"🎯 Meta: **{daily_limit} kcal**\n"
-        f"🔥 Consumido: **{daily_total} kcal**\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 **Meta:** {daily_limit} kcal\n"
+        f"🔥 **Consumo:** {daily_total} kcal\n"
+        f"⚖️ **Restante:** {max(0, daily_limit - daily_total)} kcal\n\n"
         f"📝 **Itens de hoje:**\n{items_list_text}\n"
         f"💪 **P:** {total_prot}g | 🍞 **C:** {total_carb}g | 🥑 **G:** {total_fat}g\n\n"
-        f"{progress_bar}\n"
+        f"|{progress_bar}|"
     )
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🗑️ Desfazer Item Específico", callback_data="list_undo")]
+        [InlineKeyboardButton(text="🗑️ Deletar Item Específico", callback_data="list_undo")]
     ])
     await callback.message.edit_text(status_msg, parse_mode="Markdown", reply_markup=kb)
 
@@ -998,7 +1082,13 @@ async def cmd_cancel(message: types.Message, state: FSMContext):
 
 @dp.message(Command("perfil"))
 async def start_profile(message: types.Message, state: FSMContext):
-    await message.answer("⚙️ Vamos calcular sua meta! Qual seu **peso** atual em kg? (ex: `75.5`)", parse_mode="Markdown")
+    await message.answer(
+        "⚙️ **Configuração de Perfil**\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Vamos descobrir suas necessidades diárias! Para isso, preciso de alguns dados básicos.\n\n"
+        "💪 **Qual seu peso atual em kg?**\n*(ex: 75.5)*", 
+        parse_mode="Markdown"
+    )
     await state.set_state(ProfileStates.weight)
 
 @dp.message(ProfileStates.weight)
@@ -1088,6 +1178,8 @@ async def process_goal(callback: types.CallbackQuery, state: FSMContext):
         f"Agora é só me mandar seus alimentos ou uma foto do prato! 📸🍎",
         parse_mode="Markdown"
     )
+    # Envia o teclado principal em uma nova mensagem para garantir que ele apareça
+    await callback.message.answer("O que vamos registrar agora?", reply_markup=get_main_keyboard())
 
 @dp.message(BarcodeState.waiting_for_portion)
 async def process_barcode_portion(message: types.Message, state: FSMContext):
@@ -1143,7 +1235,7 @@ async def cmd_report(message: types.Message):
     await message.answer("📊 Escolha o período do relatório:", reply_markup=kb, parse_mode="Markdown")
 
 def generate_report_chart(data: list, days: int):
-    """Generates a pie chart of macro distribution."""
+    """Generates a pie chart of macro distribution using Agg backend."""
     if not data:
         return None
     
@@ -1158,12 +1250,20 @@ def generate_report_chart(data: list, days: int):
     sizes = [total_prot, total_carb, total_fat]
     colors = ['#FF4B4B', '#FFD700', '#4CAF50']
     
+    # IMPORTANTE: Usar backend offline para evitar erros de GUI
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    
     plt.figure(figsize=(6, 6))
-    plt.pie(sizes, labels=labels, autopct='%1.1f%%', colors=colors, startangle=140)
-    plt.title(f'Macronutrientes ({days} dias)')
+    plt.pie(sizes, labels=labels, autopct='%1.1f%%', colors=colors, startangle=140, textprops={'color':"white"})
+    plt.title(f'Macronutrientes ({days} dias)', color='white')
+    
+    # Estética premium: Fundo transparente/escuro
+    plt.gcf().patch.set_facecolor('#1A1A1A')
     
     buf = io.BytesIO()
-    plt.savefig(buf, format='png', bbox_inches='tight')
+    plt.savefig(buf, format='png', bbox_inches='tight', facecolor='#1A1A1A')
     plt.close()
     buf.seek(0)
     return buf
@@ -1268,20 +1368,22 @@ async def process_food_entry(message: types.Message, items: list, raw_data: str)
     
     profile = get_user_profile(message.from_user.id)
     daily_limit = profile['tdee'] if profile else 2000
-    daily_total = get_daily_total(message.from_user.id)
+    stats = get_daily_stats(message.from_user.id)
+    daily_total = stats["kcal"]
     
     items_text = ""
     for idx, i in enumerate(items):
         emoji = "🍎" if idx % 2 == 0 else "🥩"
         meal = f"[{i.get('refeicao', 'Outro')}] "
         # Se for preciso (Verificado), não mostra tag. Se for impreciso, mostra (estimado).
-        precisao = "" if i.get("is_precise", False) else " ⚠️ *(estimado)*"
+        precisao = " ⚠️" if not i.get("is_precise", False) else ""
         
         # Tag especial para Catálogo Universal
-        universal_tag = " 🌐 *(universal)*" if i.get("is_universal") else ""
+        universal_tag = " 🌐" if i.get("is_universal") else ""
         
-        items_text += f"{emoji} {meal}**{i['alimento']}** ({i['peso']}) → {i['calorias']} kcal{precisao}{universal_tag}\n"
-        items_text += f"   └ P: {i.get('proteina', 0)}g | C: {i.get('carboidratos', 0)}g | G: {i.get('gorduras', 0)}g\n"
+        items_text += f"🍱 **{meal}{i['alimento']}**\n"
+        items_text += f"⚖️ {i['peso']}  |  🔥 **{i['calorias']} kcal**{precisao}{universal_tag}\n"
+        items_text += f"   └ 💪 **P:** {i.get('proteina', 0)}g | 🍞 **C:** {i.get('carboidratos', 0)}g | 🥑 **G:** {i.get('gorduras', 0)}g\n\n"
         
     remaining = daily_limit - daily_total
     progress_val = min(10, round((daily_total/daily_limit)*10)) if daily_limit > 0 else 0
@@ -1291,19 +1393,28 @@ async def process_food_entry(message: types.Message, items: list, raw_data: str)
     data_formatada = now_br.strftime("%d/%m")
 
     # Feedback Buttons
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+    buttons = [
         [InlineKeyboardButton(text="➕ 10%", callback_data="adj_1.1"),
          InlineKeyboardButton(text="➖ 10%", callback_data="adj_0.9")],
         [InlineKeyboardButton(text="🔄 Desfazer", callback_data="adj_undo")]
-    ])
+    ]
+    
+    # Se houver itens estimados, oferece o botão de votar
+    if any(not i.get("is_precise", False) for i in items):
+        buttons.insert(0, [InlineKeyboardButton(text="🗳️ Votar como Correto", callback_data="confirm_precise")])
+        
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
 
     response_text = (
-        f"{items_text}\n"
-        f"📊 **CONTAGEM DE HOJE ({data_formatada})**\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"🔥 Soma: **{daily_total}** / {daily_limit} kcal\n"
-        f"⚖️ Restante: **{max(0, remaining)} kcal**\n\n"
-        f"{progress_bar}"
+        f"✅ **Registro Confirmado!**\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{items_text}"
+        f"📊 **RESUMO DO DIA ({data_formatada})**\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔥 **Consumo:** {daily_total} / {daily_limit} kcal\n"
+        f"⚖️ **Restante:** **{max(0, remaining)} kcal**\n\n"
+        f"💪 **P:** {stats['protein']}g | 🍞 **C:** {stats['carbs']}g | 🥑 **G:** {stats['fat']}g\n\n"
+        f"|{progress_bar}|"
     )
     await message.answer(response_text, parse_mode="Markdown", reply_markup=kb)
 
@@ -1334,7 +1445,17 @@ async def handle_photo(message: types.Message, state: FSMContext):
 
         await status_msg.delete()
         if error_type:
-            await message.answer(f"❌ **Erro na análise da foto:** {error_type}", parse_mode="Markdown")
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📝 Descrever por Texto", callback_data="err_text")],
+                [InlineKeyboardButton(text="📖 Ver Exemplos", callback_data="err_examples")]
+            ])
+            await message.answer(
+                f"❌ **Ops! Não consegui analisar essa foto.**\n"
+                f"Motivo: {error_type}\n\n"
+                f"Tente tirar uma foto mais clara ou descreva o que você comeu clicando abaixo:", 
+                parse_mode="Markdown", 
+                reply_markup=kb
+            )
             return
 
         # ROTA 1: Código de Barras (Zera tudo e usa base oficial)
@@ -1426,11 +1547,21 @@ async def handle_text(message: types.Message):
         
         await status_msg.delete()
         if error_type:
-            await message.answer(f"❌ **Erro na extração.** Tente resumir o que você comeu.", parse_mode="Markdown")
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📖 Ver Exemplos", callback_data="err_examples")],
+                [InlineKeyboardButton(text="📸 Tentar Foto", callback_data="err_photo")]
+            ])
+            await message.answer(
+                f"❌ **Não entendi muito bem...**\n"
+                f"Tente resumir o que você comeu (ex: 'Arroz, feijão e frango 300g').\n\n"
+                f"Se preferir, me mande uma foto do prato!", 
+                parse_mode="Markdown",
+                reply_markup=kb
+            )
             return
             
         if items is not None and len(items) == 0:
-            await message.answer("🤔 Não identifiquei alimentos.")
+            await message.answer("🤔 Não identifiquei alimentos. Pode tentar descrever de outra forma?")
             return
 
         await process_food_entry(message, items, raw_data)
@@ -1456,6 +1587,57 @@ def health_check(): return {"status": "ok"}
 async def on_startup():
     await bot.set_webhook(url=f"{WEBHOOK_URL}/webhook")
     logger.info(f"Webhook set to {WEBHOOK_URL}/webhook")
+    # Inicia o loop de notificações em background
+    asyncio.create_task(reminder_loop())
+
+async def reminder_loop():
+    """Background task to send reminders to inactive users."""
+    logger.info("Loop de lembretes iniciado.")
+    while True:
+        try:
+            now_br = get_br_now()
+            hour = now_br.hour
+            
+            # Só manda lembretes entre 10h e 22h BR
+            if 10 <= hour <= 22:
+                # 1. Busca todos os usuários
+                res = supabase.table("profiles").select("user_id, name").execute()
+                users = res.data or []
+                
+                today_start = get_br_today_start()
+                
+                for user in users:
+                    uid = user['user_id']
+                    name = user['name'] or "usuário"
+                    
+                    # 2. Verifica se o usuário logou hoje
+                    log_res = supabase.table("logs") \
+                        .select("id") \
+                        .eq("user_id", str(uid)) \
+                        .gte("created_at", today_start) \
+                        .limit(1) \
+                        .execute()
+                    
+                    if not log_res.data:
+                        # Usuário não logou nada hoje.
+                        # Vamos mandar lembrete apenas em horários específicos para não flooder
+                        # 11h (Almoço), 16h (Lanche), 20h (Jantar)
+                        if hour in [11, 16, 20]:
+                            try:
+                                msg = f"🔔 **Opa {name}!** Vi que você ainda não registrou nada hoje. Como está o foco na dieta? 💪🍎"
+                                if hour == 11: msg = f"🥗 **Hora do Almoço, {name}!** Não esquece de registrar para não perder a conta! 🧐"
+                                elif hour == 20: msg = f"🌙 **O dia está acabando, {name}!** Registre suas últimas refeições para fechar o relatório de hoje. 🔥"
+                                
+                                await bot.send_message(uid, msg, parse_mode="Markdown")
+                                logger.info(f"Lembrete enviado para {uid}")
+                            except Exception as send_err:
+                                logger.warning(f"Não consegui mandar reminder para {uid}: {send_err}")
+                                
+            # Espera 1 hora antes da próxima verificação
+            await asyncio.sleep(3600) 
+        except Exception as e:
+            logger.error(f"Erro no loop de lembretes: {e}")
+            await asyncio.sleep(300) # Se der erro, espera 5 min e tenta de novo
 
 if __name__ == "__main__":
     import uvicorn

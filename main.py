@@ -347,19 +347,38 @@ def search_food_history(user_id: str, food_query: str):
         return None
 
 
-def extract_weight_in_grams(weight_text: str) -> Optional[float]:
-    """Extracts weight in grams from a free text field like '200g' or '1 porção (150 g)'."""
-    if not weight_text:
+def extract_amount(text: str) -> Optional[float]:
+    """Extracts weight (g) or volume (ml) from text. Converts kg/l to g/ml."""
+    if not text:
         return None
+    
+    # Pre-clean: "6.1" (from "6,1")
+    t = str(text).lower().replace(",", ".")
+    
+    # Check for kg/l first
+    kg_match = re.search(r"(\d+[\.,]?\d*)\s*(kg|kilo|l$|litro|l\s)", t)
+    if kg_match:
+        try:
+            val = float(kg_match.group(1))
+            return val * 1000
+        except: pass
 
-    match = re.search(r"(\d+[\.,]?\d*)\s*g", str(weight_text).lower())
-    if not match:
-        return None
+    # Check for g/ml
+    g_match = re.search(r"(\d+[\.,]?\d*)\s*(g|gr|ml)", t)
+    if g_match:
+        try:
+            return float(g_match.group(1))
+        except: pass
+    
+    # Just a number
+    num_match = re.search(r"(\d+[\.,]?\d*)", t)
+    if num_match:
+        try:
+            return float(num_match.group(1))
+        except: pass
 
-    try:
-        return float(match.group(1).replace(",", "."))
-    except ValueError:
-        return None
+    return None
+
 
 
 # --- AI Logic ---
@@ -481,15 +500,15 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
     OBJETIVO: Identificar APENAS OS NOVOS alimentos da "ENTRADA ATUAL", extraindo calorias, macronutrientes e o tipo de refeição.
     
     REGRAS DE PESQUISA:
-    1. **TABELA NUTRICIONAL:** Se houver uma tabela nutricional ou lista de ingredientes visível na imagem, EXTRAIA os valores exatos nela descritos. Isso é prioridade máxima.
-    2. **PRIORIDADE SECUNDÁRIA:** Se não houver tabela visível, use bases oficiais (TACO/IBGE/USDA).
-    3. Identifique: Nome, peso, calorias (kcal), proteínas (g), carbos (g) e gorduras (g).
+    1. **TABELA NUTRICIONAL (PRIORIDADE MÁXIMA):** Se houver uma tabela, leia os valores.
+    2. **BASE 100G/ML:** Para o campo `calorias`, `proteina`, `carboidratos` e `gorduras`, **CALCULE SEMPRE A BASE DE 100g ou 100ml**, mesmo que a tabela mostre valores por porção de 200ml ou 30g. Se a tabela diz 48kcal em 200ml, você deve retornar 24kcal (que é o valor para 100ml).
+    3. Identifique: Nome, peso original da porção lida (ex: '200ml'), calorias (base 100), proteínas (base 100), carbos (base 100) e gorduras (base 100).
     4. Classifique a REFEIÇÃO ({hora_local}: 05-10:30 Café, 11-14:30 Almoço, 18-23 Jantar, outros: Lanche).
-    5. **CÓDIGO DE BARRAS:** Se a imagem contiver um código de barras visível (EAN-13, etc), extraia os números no campo `barcode` (sem espaços).
+    5. **CÓDIGO DE BARRAS:** Se houver um código de barras visível, extraia os números no campo `barcode`.
     6. Retorne JSON: 
        {{ "items": [ {{"alimento": "str", "peso": "str", "calorias": int, "proteina": int, "carboidratos": int, "gorduras": int, "refeicao": "str", "is_precise": bool}} ], "barcode": "string_or_null", "is_packaged": bool }}
-    7. Campo `is_packaged`: `true` se for um produto industrializado individual (com embalagem/tabela); `false` se for um prato pronto ou refeição caseira.
-    8. Campo `is_precise`: `true` se a marca/tipo for identificado; `false` se for estimativa genérica.
+    7. Campo `is_packaged`: `true` se for um produto industrializado com embalagem/tabela.
+    8. Campo `is_precise`: `true` se a marca/tipo for identificado.
     
     CONTEXTO: {history_ctx}
     ENTRADA ATUAL: "{message_text}"
@@ -573,7 +592,7 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
         # Guarda de plausibilidade simples para evitar outliers absurdos
         final_items = []
         for item in sanitized_items:
-            grams = extract_weight_in_grams(item.get("peso", ""))
+            grams = extract_amount(item.get("peso", ""))
             kcal = int(float(item.get("calorias", 0)))
 
             if grams and grams > 0:
@@ -1013,26 +1032,31 @@ async def process_barcode_portion(message: types.Message, state: FSMContext):
         return
 
     # Extract weight/portion
-    grams = extract_weight_in_grams(message.text)
+    grams = extract_amount(message.text)
     
-    # Simple heuristic if no 'g' found
     if not grams:
-        try:
-            grams = float(message.text.split()[0].replace(",", "."))
-        except:
-            await message.answer("❌ Não entendi a quantidade. Digite algo como '100g' ou '200'.")
-            return
+        await message.answer("❌ Não entendi a quantidade. Digite algo como '100ml', '200g' ou apenas '200'.")
+        return
 
-    # Calculate macros based on 100g base
+    # Calculate factor based on 100g base (IA agora garante base 100)
     factor = grams / 100
+    
+    # Se o usuário escreveu um texto longo (ex: 'Suco Maguary 200ml'), tentamos extrair o nome
+    # Removemos apenas a parte numérica e unidades conhecidas
+    name_clean = re.sub(r"\d+[\.,]?\d*\s*(ml|g|gr|kg|l|copo|unidade|unid|xicara|unidades)?", "", message.text, flags=re.IGNORECASE).strip()
+    # Limpa caracteres extras como parênteses ou traços sobrando
+    name_clean = re.sub(r"^[^\w]+|[^\w]+$", "", name_clean)
+    
+    display_name = name_clean if len(name_clean) > 3 else product["alimento"]
+
     item = {
-        "alimento": product["alimento"],
-        "peso": f"{grams}g",
+        "alimento": display_name,
+        "peso": f"{grams}ml" if "ml" in message.text.lower() or "l" in message.text.lower() else f"{grams}g",
         "calorias": round(product["kcal_100g"] * factor),
         "proteina": round(product["prot_100g"] * factor),
         "carboidratos": round(product["carb_100g"] * factor),
         "gorduras": round(product["fat_100g"] * factor),
-        "refeicao": "Lanche", # Default para scanner, process_food_entry ajusta se necessário
+        "refeicao": "Lanche",
         "is_precise": True
     }
 
@@ -1221,16 +1245,14 @@ async def handle_photo(message: types.Message, state: FSMContext):
             # Transformamos o item da IA em um 'barcode_product' fake para reutilizar o flow de porção
             # mas baseamos nos valores que a IA leu da TABELA NUTRICIONAL (que agora é prioridade)
             main_item = items[0]
-            # Convertemos para base 100g para o calculador funcionar
-            weight_val = extract_weight_in_grams(main_item.get("peso", "100g")) or 100
-            factor = 100 / weight_val
-            
+            # Com o novo prompt, a IA JÁ retorna valores em base 100.
+            # Não precisamos mais calcular fatores complexos aqui, apenas confiar na base 100 da IA.
             product_data = {
                 "alimento": main_item["alimento"],
-                "kcal_100g": main_item["calorias"] * factor,
-                "prot_100g": main_item.get("proteina", 0) * factor,
-                "carb_100g": main_item.get("carboidratos", 0) * factor,
-                "fat_100g": main_item.get("gorduras", 0) * factor
+                "kcal_100g": main_item["calorias"],
+                "prot_100g": main_item.get("proteina", 0),
+                "carb_100g": main_item.get("carboidratos", 0),
+                "fat_100g": main_item.get("gorduras", 0)
             }
             await state.update_data(barcode_product=product_data)
             await message.answer(

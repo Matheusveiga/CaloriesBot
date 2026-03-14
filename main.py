@@ -1631,14 +1631,14 @@ async def reminder_loop():
             # Só manda lembretes entre 10h e 22h BR
             if 10 <= hour <= 22:
                 # 1. Busca todos os usuários
-                res = supabase.table("profiles").select("user_id, name").execute()
+                res = supabase.table("profiles").select("user_id").execute()
                 users = res.data or []
                 
                 today_start = get_br_today_start()
                 
                 for user in users:
                     uid = user['user_id']
-                    name = user['name'] or "usuário"
+                    name = "usuário" # Fallback since name is not in profiles
                     
                     # 2. Verifica se o usuário logou hoje
                     log_res = supabase.table("logs") \

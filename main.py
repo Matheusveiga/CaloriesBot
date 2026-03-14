@@ -2,6 +2,8 @@ import os
 import logging
 import json
 import io
+import re
+from json import JSONDecodeError
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 
@@ -140,23 +142,104 @@ def get_report_data(user_id: str, days: int):
         return []
 
 def delete_last_log(user_id: str):
-    """Deletes the most recent log entry for a user."""
+    """Deletes the most recent meal log (all items from last entry message)."""
     try:
         res = supabase.table("logs") \
-            .select("id") \
+            .select("id, created_at") \
             .eq("user_id", str(user_id)) \
             .order("created_at", desc=True) \
             .limit(1) \
             .execute()
         
         if res.data:
-            log_id = res.data[0]['id']
-            supabase.table("logs").delete().eq("id", log_id).execute()
+            created_at = res.data[0]['created_at']
+            supabase.table("logs").delete() \
+                .eq("user_id", str(user_id)) \
+                .eq("created_at", created_at) \
+                .execute()
             return True
         return False
     except Exception as e:
         logger.error(f"Erro ao deletar último log: {e}")
         return False
+
+
+def extract_weight_in_grams(weight_text: str) -> Optional[float]:
+    """Extracts weight in grams from a free text field like '200g' or '1 porção (150 g)'."""
+    if not weight_text:
+        return None
+
+    match = re.search(r"(\d+[\.,]?\d*)\s*g", str(weight_text).lower())
+    if not match:
+        return None
+
+    try:
+        return float(match.group(1).replace(",", "."))
+    except ValueError:
+        return None
+
+
+async def enrich_items_with_google_search(items: list):
+    """Uses Google Search tool to validate kcal values and correct obvious distortions."""
+    if not items:
+        return items
+
+    prompt = f"""
+    Você é um nutricionista e deve validar calorias com pesquisa web confiável.
+    Para cada item no JSON abaixo, pesquise valor calórico médio e recalcule as calorias usando o peso informado.
+
+    REGRAS:
+    1) Use Google Search para obter kcal por 100g (ou por unidade quando necessário).
+    2) Se o peso estiver em gramas, converta proporcionalmente.
+    3) Se não houver peso claro, mantenha o valor original.
+    4) Retorne SOMENTE JSON no formato:
+       [{{"alimento":"str","peso":"str","calorias":int}}]
+    5) calorias deve ser inteiro positivo e plausível para o alimento.
+
+    ITENS:
+    {json.dumps(items, ensure_ascii=False)}
+    """
+
+    config = ai_types.GenerateContentConfig(
+        tools=[ai_types.Tool(google_search=ai_types.GoogleSearch())]
+    )
+
+    try:
+        response = ai_client.models.generate_content(
+            model=AI_MODEL,
+            contents=[prompt],
+            config=config
+        )
+        cleaned_text = response.text.strip()
+        if "```json" in cleaned_text:
+            cleaned_text = cleaned_text.split("```json")[1].split("```")[0]
+        elif "```" in cleaned_text:
+            cleaned_text = cleaned_text.split("```")[1].split("```")[0]
+
+        validated_items = json.loads(cleaned_text.strip())
+        if not isinstance(validated_items, list):
+            return items
+
+        sanitized_items = []
+        for idx, original in enumerate(items):
+            validated = validated_items[idx] if idx < len(validated_items) else None
+            if not isinstance(validated, dict) or not validated.get("alimento"):
+                sanitized_items.append(original)
+                continue
+
+            kcal = int(float(validated.get("calorias", 0)))
+            if kcal <= 0:
+                sanitized_items.append(original)
+                continue
+
+            validated["calorias"] = kcal
+            validated.setdefault("peso", original.get("peso", ""))
+            sanitized_items.append(validated)
+
+        return sanitized_items if sanitized_items else items
+    except Exception as e:
+        logger.warning(f"Falha ao validar calorias por pesquisa web: {e}")
+        return items
 
 # --- AI Logic ---
 
@@ -220,14 +303,39 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
                 item["calorias"] = int(float(item.get("calorias", 0)))
                 sanitized_items.append(item)
         
+        # Segunda validação para reduzir superestimativas
+        sanitized_items = await enrich_items_with_google_search(sanitized_items)
+
+        # Guarda de plausibilidade simples para evitar outliers absurdos
+        final_items = []
+        for item in sanitized_items:
+            grams = extract_weight_in_grams(item.get("peso", ""))
+            kcal = int(float(item.get("calorias", 0)))
+
+            if grams and grams > 0:
+                kcal_per_100g = (kcal / grams) * 100
+                # Faixa ampla para cobrir diferentes alimentos, mas evita aberrações
+                if kcal_per_100g < 15 or kcal_per_100g > 900:
+                    logger.warning(
+                        "Valor fora da faixa plausível (%s kcal/100g) para item %s. Mantendo extração original.",
+                        round(kcal_per_100g, 2),
+                        item.get("alimento", "desconhecido")
+                    )
+
+            final_items.append(item)
+
         # Update memory with what was actually extracted
-        if sanitized_items:
+        if final_items:
             if user_id not in user_history: user_history[user_id] = []
-            extracted_summary = ", ".join([f"{i['alimento']} ({i['peso']})" for i in sanitized_items])
+            extracted_summary = ", ".join([f"{i['alimento']} ({i.get('peso', '')})" for i in final_items])
             user_history[user_id].append(f"LOGADO ANTERIORMENTE: {extracted_summary}")
             if len(user_history[user_id]) > 10: user_history[user_id] = user_history[user_id][-10:]
 
-        return sanitized_items, None, raw_text
+        return final_items, None, raw_text
+    except JSONDecodeError as e:
+        logger.error(f"Erro ao decodificar JSON da IA: {e}")
+        print(f"DEBUG GEMINI RAW: {raw_text}")
+        return None, "json_error", raw_text
     except Exception as e:
         logger.error(f"Gemini error: {e}")
         print(f"DEBUG GEMINI RAW: {raw_text}")

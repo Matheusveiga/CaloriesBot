@@ -475,9 +475,9 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
     1. PRIORIZE encontrar a TABELA NUTRICIONAL oficial (TACO/USDA ou fabricante).
     2. Identifique: Nome, peso, calorias (kcal), proteínas (g), carbos (g) e gorduras (g).
     3. Classifique a REFEIÇÃO ({hora_local}: 05-10:30 Café, 11-14:30 Almoço, 18-23 Jantar, outros: Lanche).
-    4. Adicional: Se a imagem contiver um código de barras visível, extraia o número no campo `barcode`.
+    4. **CÓDIGO DE BARRAS:** Se a imagem contiver um código de barras visível (EAN-13, etc), extraia os números no campo `barcode` (sem espaços).
     5. Retorne JSON: 
-       {{ "items": [ {{"alimento": "str", "peso": "str", "calorias": int, "proteina": int, "carboidratos": int, "gorduras": int, "refeicao": "str", "is_precise": bool}} ], "barcode": "str or null" }}
+       {{ "items": [ {{"alimento": "str", "peso": "str", "calorias": int, "proteina": int, "carboidratos": int, "gorduras": int, "refeicao": "str", "is_precise": bool}} ], "barcode": "string_or_null" }}
     6. Campo `is_precise`: `true` se a marca/tipo for identificado; `false` se for estimativa genérica.
     
     CONTEXTO: {history_ctx}
@@ -1101,7 +1101,7 @@ async def handle_photo(message: types.Message, state: FSMContext):
             return
 
         # Se detectou código de barras, busca no OpenFoodFacts
-        if barcode:
+        if barcode and str(barcode).strip() and str(barcode).strip().lower() != "null":
             product_data = await get_barcode_data(barcode)
             if product_data:
                 await state.update_data(barcode_product=product_data)
@@ -1112,6 +1112,8 @@ async def handle_photo(message: types.Message, state: FSMContext):
                 )
                 await state.set_state(BarcodeState.waiting_for_portion)
                 return
+            else:
+                logger.warning(f"Barcode {barcode} detectado mas não encontrado no OpenFoodFacts.")
 
         await process_food_entry(message, items, raw_data)
     except Exception as e:

@@ -23,6 +23,7 @@ from google import genai
 from google.genai import types as ai_types
 from supabase import create_client, Client
 from dotenv import load_dotenv
+from groq import Groq
 
 load_dotenv()
 
@@ -35,6 +36,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL")
 
 # Validation
@@ -67,6 +69,11 @@ AI_MODEL = "gemini-2.5-flash-lite"
 
 # Init Supabase
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# Init Groq (Fallback)
+groq_client = None
+if GROQ_API_KEY:
+    groq_client = Groq(api_key=GROQ_API_KEY)
 
 # States for Onboarding
 class ProfileStates(StatesGroup):
@@ -364,6 +371,40 @@ async def call_gemini_with_retry(contents, config=None, max_retries=3):
                 continue
             raise e
 
+async def call_groq_fallback(message_text: str, image_bytes: Optional[bytes] = None, prompt: str = ""):
+    """Calls Groq (Llama 3.2 Vision) as a fallback."""
+    if not groq_client:
+        return None
+    
+    try:
+        import base64
+        model = "llama-3.2-11b-vision-preview"
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                ]
+            }
+        ]
+        
+        if image_bytes:
+            base64_image = base64.b64encode(image_bytes).decode('utf-8')
+            messages[0]["content"].append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
+            })
+            
+        completion = groq_client.chat.completions.create(
+            model=model,
+            messages=messages,
+            response_format={"type": "json_object"}
+        )
+        return completion.choices[0].message.content
+    except Exception as e:
+        logger.error(f"Erro no fallback Groq: {e}")
+        return None
+
 async def get_barcode_data(barcode: str):
     """Fetches nutritional data from OpenFoodFacts."""
     url = f"https://world.openfoodfacts.org/api/v0/product/{barcode}.json"
@@ -452,7 +493,18 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
     try:
         response = await call_gemini_with_retry(contents, config=config)
         raw_text = response.text
-        
+    except Exception as e:
+        # FALLBACK: Se Gemini falhar (429 ou outro), tenta Groq
+        if groq_client:
+            logger.info("Tentando Fallback com Groq...")
+            raw_text = await call_groq_fallback(message_text, image_bytes, prompt)
+            if not raw_text:
+                return None, None, "ai_error", str(e)
+            logger.info("Fallback Groq bem sucedido!")
+        else:
+            return None, None, "ai_error", str(e)
+
+    try:
         # Robust JSON extraction
         cleaned_text = raw_text.strip()
         if "```json" in cleaned_text:

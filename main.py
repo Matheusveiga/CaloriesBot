@@ -403,6 +403,19 @@ def extract_amount(text: str) -> Optional[float]:
         (r"(copo|c\.)", 200),
         (r"(fatia|f\.)", 30)
     ]
+
+    # Frações em texto
+    fractions = {
+        "meio": 0.5, "metade": 0.5, "1/2": 0.5,
+        "um quarto": 0.25, "1/4": 0.25,
+        "um terço": 0.33, "1/3": 0.33,
+        "três quartos": 0.75, "3/4": 0.75
+    }
+    for word, mult in fractions.items():
+        if word in t:
+            for pattern, factor in household:
+                if re.search(rf"{word}\s*{pattern}", t):
+                    return mult * factor
     
     for pattern, factor in household:
         match = re.search(rf"(\d+[\.,]?\d*)?\s*{pattern}", t)
@@ -432,11 +445,17 @@ def extract_amount(text: str) -> Optional[float]:
         except: pass
         
     return None
-    if num_match:
-        try:
-            return float(num_match.group(1))
-        except: pass
 
+def parse_numeric(text: str) -> Optional[float]:
+    """Robust parser for numeric inputs like '75,5', '175cm', '80kg'."""
+    if not text: return None
+    t = text.lower().replace(',', '.')
+    match = re.search(r"(\d+[\.,]?\d*)", t)
+    if match:
+        try:
+            return float(match.group(1))
+        except:
+            return None
     return None
 
 
@@ -598,10 +617,11 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
     5. Identifique: Nome, peso original da porção lida (ex: '200ml'), calorias (base 100), proteínas (base 100), carbos (base 100) e gorduras (base 100).
     6. Classifique a REFEIÇÃO ({hora_local}: 05-10:30 Café, 11-14:30 Almoço, 18-23 Jantar, outros: Lanche).
     7. **CÓDIGO DE BARRAS:** Se houver um código de barras visível, extraia os números no campo `barcode`.
-    6. Retorne JSON: 
+    8. **FRAÇÕES E PROPORÇÕES:** Se o usuário usar termos como "meio", "metade", "1/2", "um quarto", "1/4", "um terço", "1/3", calcule os macros proporcionalmente. No campo `peso`, tente SEMPRE aproximar para gramas/ml (ex: "meio copo" -> "100ml", "meio crepe" -> "50g").
+    9. Retorne JSON: 
        {{ "items": [ {{"alimento": "str", "peso": "str", "calorias": int, "proteina": int, "carboidratos": int, "gorduras": int, "refeicao": "str", "is_precise": bool}} ], "barcode": "string_or_null", "is_packaged": bool }}
-    7. Campo `is_packaged`: `true` se for um produto industrializado com embalagem/tabela.
-    8. Campo `is_precise`: `true` se a marca/tipo for identificado.
+    10. Campo `is_packaged`: `true` se for um produto industrializado com embalagem/tabela.
+    11. Campo `is_precise`: `true` se a marca/tipo for identificado.
     
     CONTEXTO: {history_ctx}
     ENTRADA ATUAL: "{message_text}"
@@ -1093,37 +1113,37 @@ async def start_profile(message: types.Message, state: FSMContext):
 
 @dp.message(ProfileStates.weight)
 async def process_weight(message: types.Message, state: FSMContext):
-    try:
-        weight = float(message.text.replace(',', '.'))
-        await state.update_data(weight=weight)
+    val = parse_numeric(message.text)
+    if val is not None:
+        await state.update_data(weight=val)
         await message.answer("2️⃣ Qual sua **altura** em cm? (ex: `175`)", parse_mode="Markdown")
         await state.set_state(ProfileStates.height)
-    except:
-        await message.answer("⚠️ Por favor, envie um **número válido**.", parse_mode="Markdown")
+    else:
+        await message.answer("⚠️ **Ops!** Não consegui entender o peso. Tente enviar apenas o número (ex: `75,5` ou `75.5`).", parse_mode="Markdown")
 
 @dp.message(ProfileStates.height)
 async def process_height(message: types.Message, state: FSMContext):
-    try:
-        height = float(message.text)
-        await state.update_data(height=height)
+    val = parse_numeric(message.text)
+    if val is not None:
+        await state.update_data(height=val)
         await message.answer("3️⃣ Qual sua **idade**?", parse_mode="Markdown")
         await state.set_state(ProfileStates.age)
-    except:
-        await message.answer("⚠️ Por favor, envie um **número válido**.", parse_mode="Markdown")
+    else:
+        await message.answer("⚠️ **Ops!** Não entendi a altura. Tente mandar apenas os cm (ex: `175`).", parse_mode="Markdown")
 
 @dp.message(ProfileStates.age)
 async def process_age(message: types.Message, state: FSMContext):
-    try:
-        age = int(message.text)
-        await state.update_data(age=age)
+    val = parse_numeric(message.text)
+    if val is not None:
+        await state.update_data(age=int(val))
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="♂️ Masculino", callback_data="g_M"), 
              InlineKeyboardButton(text="♀️ Feminino", callback_data="g_F")]
         ])
         await message.answer("4️⃣ Qual seu **sexo**?", reply_markup=kb, parse_mode="Markdown")
         await state.set_state(ProfileStates.gender)
-    except:
-        await message.answer("⚠️ Por favor, envie um **número válido**.", parse_mode="Markdown")
+    else:
+        await message.answer("⚠️ **Ops!** Não entendi a idade. Tente mandar apenas o número (ex: `25`).", parse_mode="Markdown")
 
 @dp.callback_query(ProfileStates.gender, F.data.startswith("g_"))
 async def process_gender(callback: types.CallbackQuery, state: FSMContext):
@@ -1360,6 +1380,16 @@ async def process_food_entry(message: types.Message, items: list, raw_data: str)
     """Common logic for saving and responding to food entries."""
     if not items:
         return
+
+    # Corrigir calorias e macros baseado no peso (IA retorna base 100)
+    for i in items:
+        grams = extract_amount(i['peso'])
+        if grams is not None and grams > 0:
+            factor = grams / 100
+            i['calorias'] = round(i['calorias'] * factor)
+            i['proteina'] = round(i.get('proteina', 0) * factor)
+            i['carboidratos'] = round(i.get('carboidratos', 0) * factor)
+            i['gorduras'] = round(i.get('gorduras', 0) * factor)
 
     # Log to DB
     if not log_calories(message.from_user.id, message.from_user.full_name, items):

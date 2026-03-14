@@ -65,7 +65,7 @@ app = FastAPI()
 
 # Init Gemini (New SDK)
 ai_client = genai.Client(api_key=GEMINI_KEY)
-AI_MODEL = "gemini-2.5-flash-lite"
+AI_MODEL = "gemini-3.1-flash-lite"
 
 # Init Supabase
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -464,11 +464,11 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
                 # Não retornamos aqui, deixamos cair na IA para 'verificar'
 
     prompt = f"""
-    Você é um nutricionista especialista com ACESSO À PESQUISA GOOGLE.
+    Você é um nutricionista especialista. 
     OBJETIVO: Identificar APENAS OS NOVOS alimentos da "ENTRADA ATUAL", extraindo calorias, macronutrientes e o tipo de refeição.
     
     REGRAS DE PESQUISA:
-    1. PRIORIZE encontrar a TABELA NUTRICIONAL oficial (TACO/USDA ou fabricante) via Google Search.
+    1. PRIORIZE encontrar a TABELA NUTRICIONAL oficial (TACO/USDA ou fabricante).
     2. Identifique: Nome, peso, calorias (kcal), proteínas (g), carbos (g) e gorduras (g).
     3. Classifique a REFEIÇÃO ({hora_local}: 05-10:30 Café, 11-14:30 Almoço, 18-23 Jantar, outros: Lanche).
     4. Adicional: Se a imagem contiver um código de barras visível, extraia o número no campo `barcode`.
@@ -480,29 +480,42 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
     ENTRADA ATUAL: "{message_text}"
     """
     
-    # Configurar ferramentas
-    config = ai_types.GenerateContentConfig(
-        tools=[ai_types.Tool(google_search=ai_types.GoogleSearch())]
-    )
-
-    contents = [prompt]
-    if image_bytes:
-        contents.append(ai_types.Part.from_bytes(data=image_bytes, mime_type='image/jpeg'))
-
     raw_text = ""
-    try:
-        response = await call_gemini_with_retry(contents, config=config)
-        raw_text = response.text
-    except Exception as e:
-        # FALLBACK: Se Gemini falhar (429 ou outro), tenta Groq
-        if groq_client:
-            logger.info("Tentando Fallback com Groq...")
-            raw_text = await call_groq_fallback(message_text, image_bytes, prompt)
-            if not raw_text:
-                return None, None, "ai_error", str(e)
-            logger.info("Fallback Groq bem sucedido!")
-        else:
-            return None, None, "ai_error", str(e)
+    # --- IA LOGIC: PRIMARY (GROQ) -> FALLBACK (GEMINI) ---
+    max_groq_retries = 2
+    groq_success = False
+    
+    if groq_client:
+        for attempt in range(max_groq_retries):
+            try:
+                logger.info(f"Tentando IA Primária (Groq) - Tentativa {attempt + 1}...")
+                raw_text = await call_groq_fallback(message_text, image_bytes, prompt)
+                if raw_text:
+                    groq_success = True
+                    logger.info("IA Primária (Groq) bem sucedida!")
+                    break
+            except Exception as e:
+                logger.warning(f"Groq falhou na tentativa {attempt + 1}: {e}")
+                await asyncio.sleep(1) # Pequena espera entre retentativas
+
+    if not groq_success:
+        logger.warning("IA Primária (Groq) falhou em todas as tentativas ou não configurada. Tentando Fallback Gemini...")
+        # Configurar ferramentas especificamente para o Gemini que tem Search
+        config = ai_types.GenerateContentConfig(
+            tools=[ai_types.Tool(google_search=ai_types.GoogleSearch())]
+        )
+        contents = [prompt]
+        if image_bytes:
+            contents.append(ai_types.Part.from_bytes(data=image_bytes, mime_type='image/jpeg'))
+
+        try:
+            # Usamos o modelo configurado (gemini-3.1-flash-lite)
+            response = await call_gemini_with_retry(contents, config=config)
+            raw_text = response.text
+            logger.info("Fallback Gemini bem sucedido!")
+        except Exception as e2:
+            logger.error(f"Ambas as IAs falharam (Groq & Gemini): {e2}")
+            return None, None, "ai_error", str(e2)
 
     try:
         # Robust JSON extraction

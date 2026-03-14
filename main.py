@@ -2,6 +2,7 @@ import os
 import logging
 import json
 import io
+from PIL import Image
 import re
 import asyncio
 import httpx
@@ -66,6 +67,18 @@ app = FastAPI()
 
 # Init Gemini (New SDK)
 ai_client = genai.Client(api_key=GEMINI_KEY)
+
+async def get_embedding(text: str):
+    """Generates a vector embedding for a piece of text using Gemini."""
+    try:
+        res = await ai_client.aio.models.embed_content(
+            model='text-embedding-004',
+            contents=text
+        )
+        return res.embeddings[0].values
+    except Exception as e:
+        logger.error(f"Erro ao gerar embedding: {e}")
+        return None
 AI_MODEL = "gemini-2.0-flash" # Modelo primário (Visão/Texto em 2026)
 AI_MODEL_FALLBACK = "gemini-3.1-flash-lite-preview" # Modelo de alta RPD para fallback
 
@@ -355,12 +368,28 @@ def extract_amount(text: str) -> Optional[float]:
     # Pre-clean: "6.1" (from "6,1")
     t = str(text).lower().replace(",", ".")
     
-    # Check for kg/l first
+    # Medidas Caseiras (Conversões aproximadas)
+    household = [
+        (r"(colher\s*de\s*sopa|c\.\s*sopa|colher\s*s)", 15),
+        (r"(colher\s*de\s*sobremesa)", 10),
+        (r"(colher\s*de\s*ch[aá]|colher\s*c)", 5),
+        (r"(colher\s*de\s*caf[eé])", 2),
+        (r"(x[ií]cara)", 200),
+        (r"(copo|c\.)", 200),
+        (r"(fatia|f\.)", 30)
+    ]
+    
+    for pattern, factor in household:
+        match = re.search(rf"(\d+[\.,]?\d*)?\s*{pattern}", t)
+        if match:
+            qty = float(match.group(1)) if match.group(1) else 1.0
+            return qty * factor
+
+    # Check for kg/l
     kg_match = re.search(r"(\d+[\.,]?\d*)\s*(kg|kilo|l$|litro|l\s)", t)
     if kg_match:
         try:
-            val = float(kg_match.group(1))
-            return val * 1000
+            return float(kg_match.group(1)) * 1000
         except: pass
 
     # Check for g/ml
@@ -370,8 +399,14 @@ def extract_amount(text: str) -> Optional[float]:
             return float(g_match.group(1))
         except: pass
     
-    # Just a number
-    num_match = re.search(r"(\d+[\.,]?\d*)", t)
+    # Just a number (assumes g/ml)
+    num_match = re.search(r"^(\d+[\.,]?\d*)$", t)
+    if num_match:
+        try:
+            return float(num_match.group(1))
+        except: pass
+        
+    return None
     if num_match:
         try:
             return float(num_match.group(1))
@@ -438,8 +473,8 @@ async def call_groq_fallback(message_text: str, image_bytes: Optional[bytes] = N
         return None
 
 async def get_barcode_data(barcode: str):
-    """Fetches nutritional data from OpenFoodFacts."""
-    url = f"https://world.openfoodfacts.org/api/v0/product/{barcode}.json"
+    """Fetches nutritional data from OpenFoodFacts (Brazil)."""
+    url = f"https://br.openfoodfacts.org/api/v0/product/{barcode}.json"
     async with httpx.AsyncClient() as client:
         try:
             res = await client.get(url, timeout=10)
@@ -474,8 +509,39 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
 
     # Check Cache for text-only inputs
     cache_key = f"{message_text}_{image_bytes is not None}"
+    # --- CACHE & SEMANTIC SEARCH ---
     if not image_bytes:
-        # 1. Check In-memory cache
+        # 1. Cache Semântico (pgvector)
+        # Tenta encontrar algo similar no histórico pessoal primeiro
+        embedding = await get_embedding(message_text)
+        if embedding:
+            try:
+                # Simula chamada RPC no Supabase (usuário deve ter a função match_logs no DB)
+                match_res = supabase.rpc("match_logs", {
+                    "query_embedding": embedding,
+                    "match_threshold": 0.92, # Alta similaridade
+                    "match_count": 1,
+                    "p_user_id": str(user_id)
+                }).execute()
+                
+                if match_res.data:
+                    item = match_res.data[0]
+                    logger.info(f"🎯 Cache Semântico: {message_text} -> {item['food']}")
+                    db_match = [{
+                        "alimento": item["food"],
+                        "peso": item["weight"],
+                        "calorias": item["kcal"],
+                        "proteina": item["protein"],
+                        "carboidratos": item["carbs"],
+                        "gorduras": item["fat"],
+                        "refeicao": item["meal_type"],
+                        "is_precise": True
+                    }]
+                    return db_match, None, None, None, "SEMANTIC_CACHE"
+            except Exception as e:
+                logger.warning(f"Erro na busca semântica: {e}")
+                
+        # 2. Check In-memory cache
         if cache_key in AI_CACHE:
             logger.info(f"Usando Cache em memória para: {message_text}")
             return AI_CACHE[cache_key], None, None, "MEMORY_CACHE"
@@ -502,9 +568,11 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
     REGRAS DE PESQUISA:
     1. **TABELA NUTRICIONAL (PRIORIDADE MÁXIMA):** Se houver uma tabela, leia os valores.
     2. **BASE 100G/ML:** Para o campo `calorias`, `proteina`, `carboidratos` e `gorduras`, **CALCULE SEMPRE A BASE DE 100g ou 100ml**, mesmo que a tabela mostre valores por porção de 200ml ou 30g. Se a tabela diz 48kcal em 200ml, você deve retornar 24kcal (que é o valor para 100ml).
-    3. Identifique: Nome, peso original da porção lida (ex: '200ml'), calorias (base 100), proteínas (base 100), carbos (base 100) e gorduras (base 100).
-    4. Classifique a REFEIÇÃO ({hora_local}: 05-10:30 Café, 11-14:30 Almoço, 18-23 Jantar, outros: Lanche).
-    5. **CÓDIGO DE BARRAS:** Se houver um código de barras visível, extraia os números no campo `barcode`.
+    3. **PÓ vs PREPARADO:** Para alimentos que exigem preparo (gelatinas, bolos, refrescos em pó, mousses), **ASSUMA O PESO COMO SENDO DO PRODUTO PRONTO PARA CONSUMO** (ex: gelatina pronta = ~14kcal/100g). Só use os valores do pó seco (ex: ~380kcal/100g) se o usuário usar termos como "pó", "pacote", "sachê" ou "unidade seca". Na dúvida, aplique o valor do produto PRONTO.
+    4. **MEDIDAS CASEIRAS:** Se o usuário não informar gramas/ml, converta automaticamente: 1 colher de sopa = 15g/ml; 1 xícara/copo = 200g/ml; 1 fatia = 30g. Use o campo `peso` para indicar o valor convertido (ex: '200ml').
+    5. Identifique: Nome, peso original da porção lida (ex: '200ml'), calorias (base 100), proteínas (base 100), carbos (base 100) e gorduras (base 100).
+    6. Classifique a REFEIÇÃO ({hora_local}: 05-10:30 Café, 11-14:30 Almoço, 18-23 Jantar, outros: Lanche).
+    7. **CÓDIGO DE BARRAS:** Se houver um código de barras visível, extraia os números no campo `barcode`.
     6. Retorne JSON: 
        {{ "items": [ {{"alimento": "str", "peso": "str", "calorias": int, "proteina": int, "carboidratos": int, "gorduras": int, "refeicao": "str", "is_precise": bool}} ], "barcode": "string_or_null", "is_packaged": bool }}
     7. Campo `is_packaged`: `true` se for um produto industrializado com embalagem/tabela.
@@ -665,7 +733,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
             "precisamos configurar seu perfil (é rapidinho).",
             parse_mode="Markdown"
         )
-        await message.answer("1️⃣ Qual seu **peso** atual em kg? (ex: 75.5)")
+        await message.answer("1️⃣ Qual seu **peso** atual em kg? (ex: `75.5`)", parse_mode="Markdown")
         await state.set_state(ProfileStates.weight)
     else:
         await message.answer(
@@ -700,9 +768,9 @@ async def cmd_undo(message: types.Message):
         # Remove a última entrada da memória da IA também para manter coerência
         if message.from_user.id in user_history and user_history[message.from_user.id]:
             user_history[message.from_user.id].pop()
-        await message.answer("🔄 A última entrada foi removida com sucesso!")
+        await message.answer("🔄 **A última entrada foi removida com sucesso!**", parse_mode="Markdown")
     else:
-        await message.answer("❌ Não encontrei entradas recentes para remover.")
+        await message.answer("❌ **Não encontrei entradas recentes para remover.**", parse_mode="Markdown")
 
 @dp.message(Command("reset_dia"))
 async def cmd_reset_day(message: types.Message):
@@ -710,9 +778,9 @@ async def cmd_reset_day(message: types.Message):
         # Limpa memória local da IA também para o dia
         if message.from_user.id in user_history:
             user_history[message.from_user.id] = []
-        await message.answer("📅 Seus logs de **hoje** foram apagados!")
+        await message.answer("📅 Seus logs de **hoje** foram apagados!", parse_mode="Markdown")
     else:
-        await message.answer("❌ Erro ao apagar logs de hoje.")
+        await message.answer("❌ **Erro ao apagar logs de hoje.**", parse_mode="Markdown")
 
 @dp.message(Command("reset_perfil"))
 async def cmd_reset_profile(message: types.Message, state: FSMContext):
@@ -723,11 +791,11 @@ async def cmd_reset_profile(message: types.Message, state: FSMContext):
         if message.from_user.id in jailbreak_users:
             del jailbreak_users[message.from_user.id]
             
-        await message.answer("💥 **Perfil e histórico deletados!** Vamos começar do zero.")
+        await message.answer("💥 **Perfil e histórico deletados!** Vamos começar do zero.", parse_mode="Markdown")
         # Trigger onboarding again
         await cmd_start(message, state)
     else:
-        await message.answer("❌ Erro ao deletar seu perfil.")
+        await message.answer("❌ **Erro ao deletar seu perfil.**", parse_mode="Markdown")
 
 @dp.message(Command("status"))
 async def cmd_status(message: types.Message):
@@ -735,7 +803,7 @@ async def cmd_status(message: types.Message):
     profile = get_user_profile(user_id)
     
     if not profile:
-        await message.answer("⚠️ Você ainda não configurou seu perfil. Use /start para começar!")
+        await message.answer("⚠️ **Você ainda não configurou seu perfil.** Use /start para começar!", parse_mode="Markdown")
         return
         
     daily_limit = profile['tdee']
@@ -754,7 +822,7 @@ async def cmd_status(message: types.Message):
         items_list_text += f"• {item['food']} ({item['kcal']} kcal)\n"
     
     if not items_list_text:
-        items_list_text = "Nenhum alimento logado hoje.\n"
+        items_list_text = "_Nenhum alimento logado hoje._\n"
 
     total_prot = sum(item.get('protein', 0) for item in res.data)
     total_carb = sum(item.get('carbs', 0) for item in res.data)
@@ -766,11 +834,11 @@ async def cmd_status(message: types.Message):
     status_msg = (
         f"📊 **STATUS ATUAL ({data_formatada})**\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"🔥 Meta: **{daily_limit} kcal**\n"
-        f"✅ Consumido: **{daily_total} kcal**\n"
+        f"🎯 Meta: **{daily_limit} kcal**\n"
+        f"🔥 Consumido: **{daily_total} kcal**\n"
         f"⚖️ Restante: **{max(0, remaining)} kcal**\n\n"
         f"📝 **Itens de hoje:**\n{items_list_text}\n"
-        f"💪 Proteínas: {total_prot}g | 🍞 Carbos: {total_carb}g | 🥑 Gorduras: {total_fat}g\n\n"
+        f"💪 **P:** {total_prot}g | 🍞 **C:** {total_carb}g | 🥑 **G:** {total_fat}g\n\n"
         f"{progress_bar}\n"
         f"━━━━━━━━━━━━━━━\n"
     )
@@ -869,7 +937,7 @@ async def process_list_undo(callback: types.CallbackQuery):
     buttons.append([InlineKeyboardButton(text="⬅️ Voltar", callback_data="status_back")])
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
     
-    await callback.message.edit_text("Selecione o item que deseja **remover**:", reply_markup=kb, parse_mode="Markdown")
+    await callback.message.edit_text("🎯 Selecione o item que deseja **remover**:", reply_markup=kb, parse_mode="Markdown")
 
 @dp.callback_query(F.data.startswith("del_"))
 async def process_delete_specific(callback: types.CallbackQuery):
@@ -909,10 +977,10 @@ async def process_status_back(callback: types.CallbackQuery):
     status_msg = (
         f"📊 **STATUS ATUAL**\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"🔥 Meta: **{daily_limit} kcal**\n"
-        f"✅ Consumido: **{daily_total} kcal**\n\n"
+        f"🎯 Meta: **{daily_limit} kcal**\n"
+        f"🔥 Consumido: **{daily_total} kcal**\n\n"
         f"📝 **Itens de hoje:**\n{items_list_text}\n"
-        f"💪 P: {total_prot}g | 🍞 C: {total_carb}g | 🥑 G: {total_fat}g\n\n"
+        f"💪 **P:** {total_prot}g | 🍞 **C:** {total_carb}g | 🥑 **G:** {total_fat}g\n\n"
         f"{progress_bar}\n"
     )
     
@@ -924,13 +992,13 @@ async def process_status_back(callback: types.CallbackQuery):
 @dp.message(Command("cancelar"))
 async def cmd_cancel(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer("Operação cancelada. Como posso ajudar agora?")
+    await message.answer("🔄 **Operação cancelada.** Como posso ajudar agora?", parse_mode="Markdown")
 
 # --- Onboarding FSM ---
 
 @dp.message(Command("perfil"))
 async def start_profile(message: types.Message, state: FSMContext):
-    await message.answer("Vamos calcular sua meta! Qual seu **peso** atual em kg? (ex: 75.5)")
+    await message.answer("⚙️ Vamos calcular sua meta! Qual seu **peso** atual em kg? (ex: `75.5`)", parse_mode="Markdown")
     await state.set_state(ProfileStates.weight)
 
 @dp.message(ProfileStates.weight)
@@ -938,20 +1006,20 @@ async def process_weight(message: types.Message, state: FSMContext):
     try:
         weight = float(message.text.replace(',', '.'))
         await state.update_data(weight=weight)
-        await message.answer("2️⃣ Qual sua **altura** em cm? (ex: 175)")
+        await message.answer("2️⃣ Qual sua **altura** em cm? (ex: `175`)", parse_mode="Markdown")
         await state.set_state(ProfileStates.height)
     except:
-        await message.answer("Por favor, envie um número válido.")
+        await message.answer("⚠️ Por favor, envie um **número válido**.", parse_mode="Markdown")
 
 @dp.message(ProfileStates.height)
 async def process_height(message: types.Message, state: FSMContext):
     try:
         height = float(message.text)
         await state.update_data(height=height)
-        await message.answer("3️⃣ Qual sua **idade**?")
+        await message.answer("3️⃣ Qual sua **idade**?", parse_mode="Markdown")
         await state.set_state(ProfileStates.age)
     except:
-        await message.answer("Por favor, envie um número válido.")
+        await message.answer("⚠️ Por favor, envie um **número válido**.", parse_mode="Markdown")
 
 @dp.message(ProfileStates.age)
 async def process_age(message: types.Message, state: FSMContext):
@@ -959,13 +1027,13 @@ async def process_age(message: types.Message, state: FSMContext):
         age = int(message.text)
         await state.update_data(age=age)
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Masculino", callback_data="g_M"), 
-             InlineKeyboardButton(text="Feminino", callback_data="g_F")]
+            [InlineKeyboardButton(text="♂️ Masculino", callback_data="g_M"), 
+             InlineKeyboardButton(text="♀️ Feminino", callback_data="g_F")]
         ])
-        await message.answer("4️⃣ Qual seu **sexo**?", reply_markup=kb)
+        await message.answer("4️⃣ Qual seu **sexo**?", reply_markup=kb, parse_mode="Markdown")
         await state.set_state(ProfileStates.gender)
     except:
-        await message.answer("Por favor, envie um número válido.")
+        await message.answer("⚠️ Por favor, envie um **número válido**.", parse_mode="Markdown")
 
 @dp.callback_query(ProfileStates.gender, F.data.startswith("g_"))
 async def process_gender(callback: types.CallbackQuery, state: FSMContext):
@@ -975,11 +1043,10 @@ async def process_gender(callback: types.CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="Sedentário", callback_data="act_sedentario")],
         [InlineKeyboardButton(text="Leve (1-3 dias/sem)", callback_data="act_leve")],
         [InlineKeyboardButton(text="Moderado (3-5 dias/sem)", callback_data="act_moderado")],
-        [InlineKeyboardButton(text="Ativo (6-7 dias/sem)", callback_data="act_ativo")],
-        [InlineKeyboardButton(text="Atleta (2x dia)", callback_data="act_atleta")]
+        [InlineKeyboardButton(text="🏃 Ativo (6-7 dias/sem)", callback_data="act_ativo")],
+        [InlineKeyboardButton(text="🏆 Atleta (2x dia)", callback_data="act_atleta")]
     ])
-    await callback.message.edit_text("5️⃣ Qual seu nível de **atividade física**?", reply_markup=kb)
-    await state.set_state(ProfileStates.activity)
+    await callback.message.edit_text("5️⃣ Qual seu nível de **atividade física**?", reply_markup=kb, parse_mode="Markdown")
 
 @dp.callback_query(ProfileStates.activity, F.data.startswith("act_"))
 async def process_activity(callback: types.CallbackQuery, state: FSMContext):
@@ -987,11 +1054,11 @@ async def process_activity(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(activity=activity)
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Perder Peso", callback_data="goal_perder")],
-        [InlineKeyboardButton(text="Manter Peso", callback_data="goal_manter")],
-        [InlineKeyboardButton(text="Ganhar Massa", callback_data="goal_ganhar")]
+        [InlineKeyboardButton(text="📉 Perder Peso", callback_data="goal_perder")],
+        [InlineKeyboardButton(text="⚖️ Manter Peso", callback_data="goal_manter")],
+        [InlineKeyboardButton(text="📈 Ganhar Massa", callback_data="goal_ganhar")]
     ])
-    await callback.message.edit_text("6️⃣ Qual seu **objetivo** principal?", reply_markup=kb)
+    await callback.message.edit_text("6️⃣ Qual seu **objetivo** principal?", reply_markup=kb, parse_mode="Markdown")
     await state.set_state(ProfileStates.goal)
 
 @dp.callback_query(ProfileStates.goal, F.data.startswith("goal_"))
@@ -1016,9 +1083,10 @@ async def process_goal(callback: types.CallbackQuery, state: FSMContext):
     
     await state.clear()
     await callback.message.edit_text(
-        f"✅ Perfil configurado!\n"
-        f"Sua meta diária (ajustada para {goal}) é: **{tdee} kcal**\n\n"
-        f"Agora é só me mandar seus alimentos ou uma foto do prato! 📸🍎"
+        f"✨ **Perfil configurado!**\n\n"
+        f"🎯 Sua meta diária (ajustada para **{goal}**) é: **{tdee} kcal**\n\n"
+        f"Agora é só me mandar seus alimentos ou uma foto do prato! 📸🍎",
+        parse_mode="Markdown"
     )
 
 @dp.message(BarcodeState.waiting_for_portion)
@@ -1035,7 +1103,7 @@ async def process_barcode_portion(message: types.Message, state: FSMContext):
     grams = extract_amount(message.text)
     
     if not grams:
-        await message.answer("❌ Não entendi a quantidade. Digite algo como '100ml', '200g' ou apenas '200'.")
+        await message.answer("❌ **Não entendi a quantidade.** Digite algo como `100ml` ou `200`.", parse_mode="Markdown")
         return
 
     # Calculate factor based on 100g base (IA agora garante base 100)
@@ -1072,31 +1140,27 @@ async def cmd_report(message: types.Message):
          InlineKeyboardButton(text="Semana", callback_data="rep_7"),
          InlineKeyboardButton(text="Mês", callback_data="rep_30")]
     ])
-    await message.answer("Escolha o período do relatório:", reply_markup=kb)
+    await message.answer("📊 Escolha o período do relatório:", reply_markup=kb, parse_mode="Markdown")
 
 def generate_report_chart(data: list, days: int):
-    """Generates a bar chart of calories per day."""
+    """Generates a pie chart of macro distribution."""
     if not data:
         return None
     
-    # Aggregate by date
-    daily_totals = {}
-    for entry in data:
-        # Convert created_at to date string YYYY-MM-DD
-        dt = entry['created_at'][:10]
-        daily_totals[dt] = daily_totals.get(dt, 0) + entry['kcal']
+    total_prot = sum(d.get('protein', 0) for d in data)
+    total_carb = sum(d.get('carbs', 0) for d in data)
+    total_fat = sum(d.get('fat', 0) for d in data)
     
-    # Sort dates
-    sorted_dates = sorted(daily_totals.keys())
-    values = [daily_totals[d] for d in sorted_dates]
-    labels = [d[8:] + "/" + d[5:7] for d in sorted_dates] # DD/MM
+    if total_prot == 0 and total_carb == 0 and total_fat == 0:
+        return None
+
+    labels = ['Proteínas', 'Carbos', 'Gorduras']
+    sizes = [total_prot, total_carb, total_fat]
+    colors = ['#FF4B4B', '#FFD700', '#4CAF50']
     
-    plt.figure(figsize=(8, 5))
-    plt.bar(labels, values, color='#4CAF50')
-    plt.title(f'Consumo de Calorias - {days} dias')
-    plt.xlabel('Data')
-    plt.ylabel('kcal')
-    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.figure(figsize=(6, 6))
+    plt.pie(sizes, labels=labels, autopct='%1.1f%%', colors=colors, startangle=140)
+    plt.title(f'Macronutrientes ({days} dias)')
     
     buf = io.BytesIO()
     plt.savefig(buf, format='png', bbox_inches='tight')
@@ -1124,11 +1188,10 @@ async def process_report(callback: types.CallbackQuery):
         msg = (
             f"📊 **RELATÓRIO: {periodo.upper()}**\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔥 **Total:** {total_kcal} kcal (Média: {avg})\n"
-            f"🎯 **Sua meta:** {tdee} kcal\n\n"
-            f"💪 **Proteínas:** {total_prot}g\n"
-            f"🍞 **Carbos:** {total_carb}g\n"
-            f"🥑 **Gorduras:** {total_fat}g\n\n"
+            f"🔥 **Total:** {total_kcal} kcal\n"
+            f"🎯 **Meta:** {tdee} kcal\n"
+            f"Média: {avg} kcal/dia\n\n"
+            f"💪 **P:** {total_prot}g | 🍞 **C:** {total_carb}g | 🥑 **G:** {total_fat}g\n\n"
             f"⚖️ **Status:** {status_label}\n"
             f"━━━━━━━━━━━━━━━━━━━━"
         )
@@ -1150,6 +1213,47 @@ async def process_report(callback: types.CallbackQuery):
         logger.error(f"Erro ao gerar relatório: {e}")
         await callback.answer("❌ Erro ao gerar relatório.")
 
+@dp.message(Command("exportar"))
+async def cmd_export(message: types.Message):
+    """Exports the user's food history to a CSV file."""
+    try:
+        user_id = message.from_user.id
+        # Fetch all logs for this user
+        res = supabase.table("logs").select("*").eq("user_id", str(user_id)).order("created_at", desc=True).execute()
+        
+        if not res.data:
+            await message.answer("ℹ️ **Você ainda não tem alimentos logados.**", parse_mode="Markdown")
+            return
+            
+        import csv
+        output = io.StringIO()
+        writer = csv.DictWriter(output, fieldnames=["created_at", "food", "weight", "kcal", "protein", "carbs", "fat", "meal_type"])
+        writer.writeheader()
+        
+        for row in res.data:
+            writer.writerow({
+                "created_at": row["created_at"],
+                "food": row["food"],
+                "weight": row["weight"],
+                "kcal": row["kcal"],
+                "protein": row["protein"],
+                "carbs": row["carbs"],
+                "fat": row["fat"],
+                "meal_type": row["meal_type"]
+            })
+            
+        output.seek(0)
+        csv_bytes = output.getvalue().encode('utf-8')
+        
+        await message.answer_document(
+            document=types.BufferedInputFile(csv_bytes, filename=f"log_calorias_{datetime.now().strftime('%Y%m%d')}.csv"),
+            caption="📂 **Aqui está seu histórico completo de alimentos!**",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"Erro ao exportar: {e}")
+        await message.answer("❌ **Ocorreu um erro ao exportar seus dados.**", parse_mode="Markdown")
+
 # --- Food and Vision Handling ---
 
 async def process_food_entry(message: types.Message, items: list, raw_data: str):
@@ -1159,7 +1263,7 @@ async def process_food_entry(message: types.Message, items: list, raw_data: str)
 
     # Log to DB
     if not log_calories(message.from_user.id, message.from_user.full_name, items):
-        await message.answer("❌ Erro ao salvar dados no Supabase.")
+        await message.answer("❌ **Erro ao salvar dados.** Tente novamente.", parse_mode="Markdown")
         return
     
     profile = get_user_profile(message.from_user.id)
@@ -1206,7 +1310,7 @@ async def process_food_entry(message: types.Message, items: list, raw_data: str)
 @dp.message(F.photo, StateFilter(None))
 async def handle_photo(message: types.Message, state: FSMContext):
     try:
-        status_msg = await message.answer("Analisando foto... 📸👀")
+        status_msg = await message.answer("🔍 **Analisando foto...** 📸👀", parse_mode="Markdown")
         
         # Get the best photo size
         photo = message.photo[-1]
@@ -1214,15 +1318,23 @@ async def handle_photo(message: types.Message, state: FSMContext):
         photo_bytes = io.BytesIO()
         await bot.download_file(file.file_path, destination=photo_bytes)
         
+        # OTIMIZAÇÃO: Comprimir imagem antes de enviar para Gemini
+        img = Image.open(photo_bytes)
+        # Redimensiona mantendo proporção (max 1600px largura/altura)
+        img.thumbnail((1600, 1600))
+        compressed_io = io.BytesIO()
+        img.convert("RGB").save(compressed_io, format="JPEG", quality=80, optimize=True)
+        final_bytes = compressed_io.getvalue()
+        
         items, barcode, is_packaged, error_type, raw_data = await extract_calories_list(
             user_id=message.from_user.id,
-            image_bytes=photo_bytes.getvalue(),
+            image_bytes=final_bytes,
             message_text=message.caption or "Foto de comida"
         )
 
         await status_msg.delete()
         if error_type:
-            await message.answer(f"❌ Erro na análise da foto: {error_type}")
+            await message.answer(f"❌ **Erro na análise da foto:** {error_type}", parse_mode="Markdown")
             return
 
         # ROTA 1: Código de Barras (Zera tudo e usa base oficial)
@@ -1266,7 +1378,7 @@ async def handle_photo(message: types.Message, state: FSMContext):
         await process_food_entry(message, items, raw_data)
     except Exception as e:
         logger.error(f"Erro no handle_photo: {e}")
-        await message.answer("❌ Ocorreu um erro inesperado ao processar a foto.")
+        await message.answer("❌ **Ocorreu um erro inesperado** ao processar a foto.", parse_mode="Markdown")
 
 @dp.message(F.text, StateFilter(None))
 async def handle_text(message: types.Message):
@@ -1276,7 +1388,7 @@ async def handle_text(message: types.Message):
         processed_messages.add(msg_id)
         if len(processed_messages) > 1000: processed_messages.clear()
 
-        status_msg = await message.answer("Calculando... 🧐")
+        status_msg = await message.answer("🧐 **Calculando...**", parse_mode="Markdown")
         
         user_id = message.from_user.id
         
@@ -1285,7 +1397,7 @@ async def handle_text(message: types.Message):
             if is_apology(message.text):
                 jailbreak_users[user_id] = False
                 await status_msg.delete()
-                await message.answer("Ah, finalmente percebeu o erro? Tá bom, vamos voltar ao normal. O que você comeu?")
+                await message.answer("😇 Ah, finalmente percebeu o erro? Tá bom, vamos voltar ao normal. O que você comeu?")
                 return
             else:
                 sarcasm = await generate_sarcastic_response(user_id, message.text)
@@ -1314,7 +1426,7 @@ async def handle_text(message: types.Message):
         
         await status_msg.delete()
         if error_type:
-            await message.answer(f"❌ Erro na extração. Tente novamente.")
+            await message.answer(f"❌ **Erro na extração.** Tente resumir o que você comeu.", parse_mode="Markdown")
             return
             
         if items is not None and len(items) == 0:
@@ -1324,7 +1436,7 @@ async def handle_text(message: types.Message):
         await process_food_entry(message, items, raw_data)
     except Exception as e:
         logger.error(f"Erro no handle_text: {e}")
-        await message.answer("❌ Ocorreu um erro inesperado.")
+        await message.answer("❌ **Ocorreu um erro inesperado.**", parse_mode="Markdown")
 
 # --- FastAPI Webhook ---
 

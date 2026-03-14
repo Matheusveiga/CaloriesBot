@@ -603,25 +603,49 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
                 return db_match, None, None, "DB_VERIFIED_CACHE"
             elif db_match:
                 logger.info(f"Item no DB é impreciso. Chamando IA para verificação: {message_text}")
-                # Não retornamos aqui, deixamos cair na IA para 'verificar'
 
     prompt = f"""
-    Você é um nutricionista especialista. 
-    OBJETIVO: Identificar APENAS OS NOVOS alimentos da "ENTRADA ATUAL", extraindo calorias, macronutrientes e o tipo de refeição.
+    Você é um nutricionista especialista de ELITE. 
+    OBJETIVO: Identificar alimentos da "ENTRADA ATUAL", extraindo calorias, macronutrientes e o tipo de refeição.
     
-    REGRAS DE PESQUISA:
-    1. **TABELA NUTRICIONAL (PRIORIDADE MÁXIMA):** Se houver uma tabela, leia os valores.
-    2. **BASE 100G/ML:** Para o campo `calorias`, `proteina`, `carboidratos` e `gorduras`, **CALCULE SEMPRE A BASE DE 100g ou 100ml**, mesmo que a tabela mostre valores por porção de 200ml ou 30g. Se a tabela diz 48kcal em 200ml, você deve retornar 24kcal (que é o valor para 100ml).
-    3. **PÓ vs PREPARADO:** Para alimentos que exigem preparo (gelatinas, bolos, refrescos em pó, mousses), **ASSUMA O PESO COMO SENDO DO PRODUTO PRONTO PARA CONSUMO** (ex: gelatina pronta = ~14kcal/100g). Só use os valores do pó seco (ex: ~380kcal/100g) se o usuário usar termos como "pó", "pacote", "sachê" ou "unidade seca". Na dúvida, aplique o valor do produto PRONTO.
-    4. **MEDIDAS CASEIRAS:** Se o usuário não informar gramas/ml, converta automaticamente: 1 colher de sopa = 15g/ml; 1 xícara/copo = 200g/ml; 1 fatia = 30g. Use o campo `peso` para indicar o valor convertido (ex: '200ml').
-    5. Identifique: Nome, peso original da porção lida (ex: '200ml'), calorias (base 100), proteínas (base 100), carbos (base 100) e gorduras (base 100).
-    6. Classifique a REFEIÇÃO ({hora_local}: 05-10:30 Café, 11-14:30 Almoço, 18-23 Jantar, outros: Lanche).
-    7. **CÓDIGO DE BARRAS:** Se houver um código de barras visível, extraia os números no campo `barcode`.
-    8. **FRAÇÕES E PROPORÇÕES:** Se o usuário usar termos como "meio", "metade", "1/2", "um quarto", "1/4", "um terço", "1/3", calcule os macros proporcionalmente. No campo `peso`, tente SEMPRE aproximar para gramas/ml (ex: "meio copo" -> "100ml", "meio crepe" -> "50g").
-    9. Retorne JSON: 
-       {{ "items": [ {{"alimento": "str", "peso": "str", "calorias": int, "proteina": int, "carboidratos": int, "gorduras": int, "refeicao": "str", "is_precise": bool}} ], "barcode": "string_or_null", "is_packaged": bool }}
-    10. Campo `is_packaged`: `true` se for um produto industrializado com embalagem/tabela.
-    11. Campo `is_precise`: `true` se a marca/tipo for identificado.
+    ESTRATÉGIA DE PESQUISA (CRÍTICO):
+    1. **MARCAS E PRODUTOS:** Se a entrada contiver marcas (ex: Paderrí, Nestlé, Bauducco, Coca-Cola) ou produtos específicos, **USE A FERRAMENTA DE PESQUISA DO GOOGLE** para encontrar a tabela nutricional OFICIAL.
+    2. **PRIORIDADE DE DADOS:** 
+       - 1º: Tabela nutricional oficial encontrada via pesquisa.
+       - 2º: Tabela nutricional visível na imagem (se houver).
+       - 3º: Conhecimento interno para itens genéricos (ex: maçã, arroz branco).
+    3. **BASE 100G/ML (Obrigatório):** Independentemente da porção que você encontrar, **RETORNE SEMPRE OS VALORES PARA 100g ou 100ml**. 
+       - Exemplo: Se o crepe Paderrí tem 111kcal em 30g, você deve calcular (111 / 30 * 100) = ~370kcal.
+       - Macros (P, C, G) também devem ser convertidos para a base 100.
+    4. **COERÊNCIA:** Se o usuário desfizer e refazer a mesma entrada, os valores devem ser idênticos. Baseie-se em dados reais, não em estimativas aleatórias.
+    
+    REGRAS DE EXTRAÇÃO:
+    5. **PÓ vs PREPARADO:** Para alimentos que exigem preparo, assuma o peso do produto PRONTO.
+    6. **MEDIDAS CASEIRAS:** Converta automaticamente (1 colher sopa = 15g, 1 xícara = 200ml, 1 fatia = 30g).
+    7. Classifique a REFEIÇÃO ({hora_local}: 05-10:30 Café, 11-14:30 Almoço, 18-23 Jantar, outros: Lanche).
+    8. **FRAÇÕES:** Se o usuário disser "meio" ou "1/2", o campo `peso` deve refletir isso (ex: "meio crepe" de 30g -> 15g).
+    
+    OUTPUT JSON:
+    {{ 
+      "items": [ 
+        {{
+          "alimento": "Nome Marca/Produto", 
+          "peso": "peso_em_g_ou_ml", 
+          "calorias": int_base_100, 
+          "proteina": int_base_100, 
+          "carboidratos": int_base_100, 
+          "gorduras": int_base_100, 
+          "refeicao": "str", 
+          "is_precise": bool,
+          "verified_via_search": bool
+        }} 
+      ], 
+      "barcode": "string_or_null", 
+      "is_packaged": bool 
+    }}
+    
+    is_precise: true se encontrou a marca exata.
+    verified_via_search: true se usou a ferramenta de pesquisa para validar.
     
     CONTEXTO: {history_ctx}
     ENTRADA ATUAL: "{message_text}"
@@ -636,28 +660,47 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
     ai_success = False
 
     if use_vision:
-        logger.info("ROTA IMAGEM: Tentando IA Especialista (Gemini 1.5 Flash)...")
+        logger.info("ROTA IMAGEM: IA Especialista (Gemini 2.0 Flash) + Search...")
         config = ai_types.GenerateContentConfig(
-            tools=[ai_types.Tool(google_search=ai_types.GoogleSearch())]
+            tools=[ai_types.Tool(google_search=ai_types.GoogleSearch())],
+            temperature=0.1 # Mais determinístico
         )
         contents = [prompt]
         contents.append(ai_types.Part.from_bytes(data=image_bytes, mime_type='image/jpeg'))
         
         try:
-            response = await call_gemini_with_retry(contents, config=config) # Versão 1.5 Flash
+            response = await call_gemini_with_retry(contents, config=config)
             raw_text = response.text
             ai_success = True
-            logger.info("IA Especialista (Gemini 1.5 Flash) bem sucedida!")
         except Exception as e:
-            logger.warning(f"Gemini 1.5 Flash falhou: {e}. Indo para Fallback Lite...")
+            logger.warning(f"Gemini Vision falhou: {e}. Indo para Fallback...")
     else:
-        logger.info("ROTA TEXTO: Tentando IA de Alta Velocidade (Groq 70B)...")
-        if groq_client:
+        # Para texto, agora também usamos Gemini 2.0 Flash se parecer um produto de marca
+        is_branded = any(brand in message_text.lower() for brand in ["marca", "paderri", "nestle", "bauducco", "coca", "sadia", "perdigao"])
+        
+        if is_branded:
+            logger.info("ROTA TEXTO (MARCA): IA Especialista (Gemini 2.0 Flash) + Search...")
+            config = ai_types.GenerateContentConfig(
+                tools=[ai_types.Tool(google_search=ai_types.GoogleSearch())],
+                temperature=0.1
+            )
+            try:
+                response = await ai_client.aio.models.generate_content(
+                    model=AI_MODEL,
+                    contents=[prompt],
+                    config=config
+                )
+                raw_text = response.text
+                ai_success = True
+            except Exception as e:
+                logger.warning(f"Gemini Text Search falhou: {e}")
+        
+        if not ai_success and groq_client:
+            logger.info("ROTA TEXTO: IA de Alta Velocidade (Groq)...")
             try:
                 raw_text = await call_groq_fallback(message_text, None, prompt)
                 if raw_text:
                     ai_success = True
-                    logger.info("IA de Alta Velocidade (Groq) bem sucedida!")
             except Exception as e:
                 logger.warning(f"Groq falhou: {e}")
 
@@ -699,7 +742,14 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
         sanitized_items = []
         for item in items:
             if isinstance(item, dict) and item.get("alimento"):
+                # Force ints for macros
                 item["calorias"] = int(float(item.get("calorias", 0)))
+                item["proteina"] = int(float(item.get("proteina", 0)))
+                item["carboidratos"] = int(float(item.get("carboidratos", 0)))
+                item["gorduras"] = int(float(item.get("gorduras", 0)))
+                # Preserve flags
+                item["is_precise"] = bool(item.get("is_precise", False))
+                item["is_universal"] = bool(item.get("verified_via_search", False)) # Use research as universal proof
                 sanitized_items.append(item)
 
         # Guarda de plausibilidade simples para evitar outliers absurdos

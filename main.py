@@ -130,6 +130,16 @@ async def generate_sarcastic_response(user_id: int, message_text: str):
         logger.error(f"Erro ao gerar sarcasmo: {e}")
         return "Ah, que original. Outra tentativa brilhante. 🙄"
 
+# --- Timezone Helpers ---
+
+def get_br_now():
+    """Returns the current datetime in Brazil (UTC-3)."""
+    return datetime.utcnow() - timedelta(hours=3)
+
+def get_br_today_start():
+    """Returns the start of today in Brazil (00:00:00) in ISO format with offset."""
+    return get_br_now().strftime("%Y-%m-%dT00:00:00-03:00")
+
 # --- DB Logic ---
 
 def log_calories(user_id: str, user_name: str, items: list):
@@ -167,16 +177,12 @@ def get_user_profile(user_id: str):
 def get_daily_total(user_id: str):
     """Calculates the total calories for the current day using Brazil Time (UTC-3)."""
     try:
-        # Ajuste manual para o fuso do usuário (Brasília UTC-3)
-        # Note: In production, consider asking for user's TZ or using a more robust method
-        now_utc = datetime.utcnow()
-        now_br = now_utc - timedelta(hours=3)
-        today_br = now_br.strftime("%Y-%m-%d")
+        today_br_start = get_br_today_start()
         
         response = supabase.table("logs") \
             .select("kcal") \
             .eq("user_id", str(user_id)) \
-            .gte("created_at", today_br) \
+            .gte("created_at", today_br_start) \
             .execute()
         return sum(item.get('kcal', 0) for item in response.data)
     except Exception as e:
@@ -186,9 +192,8 @@ def get_daily_total(user_id: str):
 def get_report_data(user_id: str, days: int):
     """Aggregates data for periodic reports."""
     try:
-        now_utc = datetime.utcnow()
-        now_br = now_utc - timedelta(hours=3)
-        start_date = (now_br - timedelta(days=days)).strftime("%Y-%m-%d")
+        now_br = get_br_now()
+        start_date = (now_br - timedelta(days=days)).strftime("%Y-%m-%dT00:00:00-03:00")
         
         response = supabase.table("logs") \
             .select("created_at, kcal") \
@@ -225,13 +230,11 @@ def delete_last_log(user_id: str):
 def delete_today_logs(user_id: str):
     """Deletes all logs from the current day."""
     try:
-        now_utc = datetime.utcnow()
-        now_br = now_utc - timedelta(hours=3)
-        today_br = now_br.strftime("%Y-%m-%d")
+        today_br_start = get_br_today_start()
         
         supabase.table("logs").delete() \
             .eq("user_id", str(user_id)) \
-            .gte("created_at", today_br) \
+            .gte("created_at", today_br_start) \
             .execute()
         return True
     except Exception as e:
@@ -339,7 +342,7 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
     history_ctx = "\n".join(history[-5:]) if history else "Sem histórico."
     
     # Horário local Brasil (UTC-3) para inferência de refeição
-    now_br = datetime.utcnow() - timedelta(hours=3)
+    now_br = get_br_now()
     hora_local = now_br.strftime("%H:%M")
 
     prompt = f"""
@@ -498,8 +501,9 @@ async def cmd_help(message: types.Message):
         "3. **Refeições:** Eu identifico se é Almoço, Jantar, etc.\n"
         "4. **Perfil:** Use /perfil para atualizar dados e seu OBJETIVO (Bulk/Cut).\n"
         "5. **Relatórios:** Use /relatorio para ver progresso e GRÁFICOS.\n"
-        "6. **Desfazer:** Errou algo? Use /desfazer para remover o último log.\n"
-        "7. **Resets:** /reset_dia apaga hoje; /reset_perfil apaga TUDO."
+        "6. **Status:** Use /status para ver rapidamente como está sua meta hoje.\n"
+        "7. **Desfazer:** Errou algo? Use /desfazer para remover o último log.\n"
+        "8. **Resets:** /reset_dia apaga hoje; /reset_perfil apaga TUDO."
     )
     await message.answer(help_text, parse_mode="Markdown")
 
@@ -537,6 +541,54 @@ async def cmd_reset_profile(message: types.Message, state: FSMContext):
         await cmd_start(message, state)
     else:
         await message.answer("❌ Erro ao deletar seu perfil.")
+
+@dp.message(Command("status"))
+async def cmd_status(message: types.Message):
+    user_id = message.from_user.id
+    profile = get_user_profile(user_id)
+    
+    if not profile:
+        await message.answer("⚠️ Você ainda não configurou seu perfil. Use /start para começar!")
+        return
+        
+    daily_limit = profile['tdee']
+    daily_total = get_daily_total(user_id)
+    remaining = daily_limit - daily_total
+    
+    # Get current meal data for macros breakdown
+    today_br_start = get_br_today_start()
+    now_br = get_br_now()
+    data_formatada = now_br.strftime("%d/%m/%Y %H:%M")
+    
+    res = supabase.table("logs").select("protein, carbs, fat").eq("user_id", str(user_id)).gte("created_at", today_br_start).execute()
+    total_prot = sum(item.get('protein', 0) for item in res.data)
+    total_carb = sum(item.get('carbs', 0) for item in res.data)
+    total_fat = sum(item.get('fat', 0) for item in res.data)
+
+    progress_val = min(10, round((daily_total/daily_limit)*10)) if daily_limit > 0 else 0
+    progress_bar = "🔵" * progress_val + "⚪" * (10 - progress_val)
+
+    status_msg = (
+        f"📊 **STATUS ATUAL ({data_formatada})**\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"🔥 Meta: **{daily_limit} kcal**\n"
+        f"✅ Consumido: **{daily_total} kcal**\n"
+        f"⚖️ Restante: **{max(0, remaining)} kcal**\n\n"
+        f"💪 Proteínas: {total_prot}g\n"
+        f"🍞 Carbos: {total_carb}g\n"
+        f"🥑 Gorduras: {total_fat}g\n\n"
+        f"{progress_bar}\n"
+        f"━━━━━━━━━━━━━━━\n"
+    )
+    
+    if remaining < 0:
+        status_msg += "⚠️ Você ultrapassou a meta de hoje!"
+    elif remaining < 200:
+        status_msg += "🟡 Quase lá! Cuidado com o próximo lanche."
+    else:
+        status_msg += "🟢 No caminho certo!"
+
+    await message.answer(status_msg, parse_mode="Markdown")
 
 @dp.message(Command("cancelar"))
 async def cmd_cancel(message: types.Message, state: FSMContext):
@@ -751,10 +803,13 @@ async def process_food_entry(message: types.Message, items: list, raw_data: str)
     remaining = daily_limit - daily_total
     progress_val = min(10, round((daily_total/daily_limit)*10)) if daily_limit > 0 else 0
     progress_bar = "🔵" * progress_val + "⚪" * (10 - progress_val)
+    
+    now_br = get_br_now()
+    data_formatada = now_br.strftime("%d/%m")
 
     response_text = (
         f"{items_text}\n"
-        f"📊 **CONTAGEM DE HOJE**\n"
+        f"📊 **CONTAGEM DE HOJE ({data_formatada})**\n"
         f"━━━━━━━━━━━━━━━\n"
         f"🔥 Soma: **{daily_total}** / {daily_limit} kcal\n"
         f"⚖️ Restante: **{max(0, remaining)} kcal**\n\n"

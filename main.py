@@ -4,6 +4,7 @@ import json
 import io
 import re
 import asyncio
+import httpx
 from json import JSONDecodeError
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
@@ -23,7 +24,7 @@ from google import genai
 from google.genai import types as ai_types
 from supabase import create_client, Client
 from dotenv import load_dotenv
-from groq import Groq
+from groq import AsyncGroq
 
 load_dotenv()
 
@@ -74,7 +75,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 # Init Groq (Fallback)
 groq_client = None
 if GROQ_API_KEY:
-    groq_client = Groq(api_key=GROQ_API_KEY)
+    groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 
 # States for Onboarding
 class ProfileStates(StatesGroup):
@@ -133,7 +134,7 @@ async def generate_sarcastic_response(user_id: int, message_text: str):
     USUÁRIO DISSE: "{message_text}"
     """
     try:
-        response = ai_client.models.generate_content(
+        response = await ai_client.aio.models.generate_content(
             model=AI_MODEL,
             contents=[prompt]
         )
@@ -358,7 +359,8 @@ async def call_gemini_with_retry(contents, config=None, max_retries=3):
     """Calls Gemini with exponential backoff for 429 errors."""
     for i in range(max_retries):
         try:
-            response = ai_client.models.generate_content(
+            # Use .aio for non-blocking calls
+            response = await ai_client.aio.models.generate_content(
                 model=AI_MODEL,
                 contents=contents,
                 config=config
@@ -397,7 +399,7 @@ async def call_groq_fallback(message_text: str, image_bytes: Optional[bytes] = N
                 "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
             })
             
-        completion = groq_client.chat.completions.create(
+        completion = await groq_client.chat.completions.create(
             model=model,
             messages=messages,
             response_format={"type": "json_object"}
@@ -1077,94 +1079,102 @@ async def process_food_entry(message: types.Message, items: list, raw_data: str)
     await message.answer(response_text, parse_mode="Markdown", reply_markup=kb)
 
 @dp.message(F.photo, StateFilter(None))
-async def handle_photo(message: types.Message):
-    status_msg = await message.answer("Analisando foto... 📸👀")
-    
-    # Get the best photo size
-    photo = message.photo[-1]
-    file = await bot.get_file(photo.file_id)
-    photo_bytes = io.BytesIO()
-    await bot.download_file(file.file_path, destination=photo_bytes)
-    
-    items, barcode, error_type, raw_data = await extract_calories_list(
-        user_id=message.from_user.id,
-        image_bytes=photo_bytes.getvalue(),
-        message_text=message.caption or "Foto de comida"
-    )
+async def handle_photo(message: types.Message, state: FSMContext):
+    try:
+        status_msg = await message.answer("Analisando foto... 📸👀")
+        
+        # Get the best photo size
+        photo = message.photo[-1]
+        file = await bot.get_file(photo.file_id)
+        photo_bytes = io.BytesIO()
+        await bot.download_file(file.file_path, destination=photo_bytes)
+        
+        items, barcode, error_type, raw_data = await extract_calories_list(
+            user_id=message.from_user.id,
+            image_bytes=photo_bytes.getvalue(),
+            message_text=message.caption or "Foto de comida"
+        )
 
-    await status_msg.delete()
-    if error_type:
-        await message.answer(f"❌ Erro na análise da foto: {error_type}")
-        return
-
-    # Se detectou código de barras, busca no OpenFoodFacts
-    if barcode:
-        product_data = await get_barcode_data(barcode)
-        if product_data:
-            await state.update_data(barcode_product=product_data)
-            await message.answer(
-                f"🔍 **Produto Detectado:** {product_data['alimento']}\n\n"
-                "Quanto você consumiu deste produto? (ex: 100g, 50, 2 unidades)",
-                parse_mode="Markdown"
-            )
-            await state.set_state(BarcodeState.waiting_for_portion)
+        await status_msg.delete()
+        if error_type:
+            await message.answer(f"❌ Erro na análise da foto: {error_type}")
             return
 
-    await process_food_entry(message, items, raw_data)
+        # Se detectou código de barras, busca no OpenFoodFacts
+        if barcode:
+            product_data = await get_barcode_data(barcode)
+            if product_data:
+                await state.update_data(barcode_product=product_data)
+                await message.answer(
+                    f"🔍 **Produto Detectado:** {product_data['alimento']}\n\n"
+                    "Quanto você consumiu deste produto? (ex: 100g, 50, 2 unidades)",
+                    parse_mode="Markdown"
+                )
+                await state.set_state(BarcodeState.waiting_for_portion)
+                return
+
+        await process_food_entry(message, items, raw_data)
+    except Exception as e:
+        logger.error(f"Erro no handle_photo: {e}")
+        await message.answer("❌ Ocorreu um erro inesperado ao processar a foto.")
 
 @dp.message(F.text, StateFilter(None))
 async def handle_text(message: types.Message):
-    msg_id = f"{message.chat.id}:{message.message_id}"
-    if msg_id in processed_messages: return
-    processed_messages.add(msg_id)
-    if len(processed_messages) > 1000: processed_messages.clear()
+    try:
+        msg_id = f"{message.chat.id}:{message.message_id}"
+        if msg_id in processed_messages: return
+        processed_messages.add(msg_id)
+        if len(processed_messages) > 1000: processed_messages.clear()
 
-    status_msg = await message.answer("Calculando... 🧐")
-    
-    user_id = message.from_user.id
-    
-    # Check if user is in sarcasm mode
-    if jailbreak_users.get(user_id):
-        if is_apology(message.text):
-            jailbreak_users[user_id] = False
-            await status_msg.delete()
-            await message.answer("Ah, finalmente percebeu o erro? Tá bom, vamos voltar ao normal. O que você comeu?")
-            return
-        else:
-            sarcasm = await generate_sarcastic_response(user_id, message.text)
-            await status_msg.delete()
-            await message.answer(sarcasm)
-            return
-
-    # Check for new jailbreak attempt
-    if is_jailbreak(message.text):
-        jailbreak_users[user_id] = True
-        await status_msg.delete()
-        await message.answer("Eae amigão, ta tentando mandar um Jailbreak para CaloriesBot? Não vai conseguir.")
-        return
-
-    # Busca rápida no histórico antes da IA
-    if len(message.text.split()) <= 3:
-        db_match = search_food_history(user_id, message.text.strip())
-        if db_match and db_match[0].get("is_approximate"):
-            # Deixa a IA processar ou poderíamos implementar confirmação
-            pass
-
-    items, barcode, error_type, raw_data = await extract_calories_list(
-        user_id=user_id, 
-        message_text=message.text
-    )
-    
-    await status_msg.delete()
-    if error_type:
-        await message.answer(f"❌ Erro na extração. Tente novamente.")
-        return
+        status_msg = await message.answer("Calculando... 🧐")
         
-    if items is not None and len(items) == 0:
-        await message.answer("🤔 Não identifiquei alimentos.")
-        return
+        user_id = message.from_user.id
+        
+        # Check if user is in sarcasm mode
+        if jailbreak_users.get(user_id):
+            if is_apology(message.text):
+                jailbreak_users[user_id] = False
+                await status_msg.delete()
+                await message.answer("Ah, finalmente percebeu o erro? Tá bom, vamos voltar ao normal. O que você comeu?")
+                return
+            else:
+                sarcasm = await generate_sarcastic_response(user_id, message.text)
+                await status_msg.delete()
+                await message.answer(sarcasm)
+                return
 
-    await process_food_entry(message, items, raw_data)
+        # Check for new jailbreak attempt
+        if is_jailbreak(message.text):
+            jailbreak_users[user_id] = True
+            await status_msg.delete()
+            await message.answer("Eae amigão, ta tentando mandar um Jailbreak para CaloriesBot? Não vai conseguir.")
+            return
+
+        # Busca rápida no histórico antes da IA
+        if len(message.text.split()) <= 3:
+            db_match = search_food_history(user_id, message.text.strip())
+            if db_match and db_match[0].get("is_approximate"):
+                # Deixa a IA processar ou poderíamos implementar confirmação
+                pass
+
+        items, barcode, error_type, raw_data = await extract_calories_list(
+            user_id=user_id, 
+            message_text=message.text
+        )
+        
+        await status_msg.delete()
+        if error_type:
+            await message.answer(f"❌ Erro na extração. Tente novamente.")
+            return
+            
+        if items is not None and len(items) == 0:
+            await message.answer("🤔 Não identifiquei alimentos.")
+            return
+
+        await process_food_entry(message, items, raw_data)
+    except Exception as e:
+        logger.error(f"Erro no handle_text: {e}")
+        await message.answer("❌ Ocorreu um erro inesperado.")
 
 # --- FastAPI Webhook ---
 

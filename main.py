@@ -616,6 +616,11 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
        - 3º: Conhecimento interno para itens genéricos (ex: maçã, arroz branco).
     3. **BASE 100G/ML (Obrigatório):** Independentemente da porção que você encontrar, **RETORNE SEMPRE OS VALORES PARA 100g ou 100ml**. 
        - Exemplo: Se o crepe Paderrí tem 111kcal em 30g, você deve calcular (111 / 30 * 100) = ~370kcal.
+    PESQUISA DE PORÇÕES (ITENS IN NATURA/GRANEL):
+    Se o usuário não especificar gramas/ml para itens comuns (ex: "um pão francês", "uma maçã", "duas bananas"):
+    1. **PESQUISE NO GOOGLE** o "peso médio usual de uma unidade no Brasil".
+    2. Use a média encontrada via pesquisa para o cálculo.
+    3. Padrões conhecidos para referência rápida: Pão Francês (~50g), Ovo (~50g), Banana (~80-100g). Na dúvida, PESQUISE em vez de chutar.
        - Macros (P, C, G) também devem ser convertidos para a base 100.
     4. **COERÊNCIA:** Se o usuário desfizer e refazer a mesma entrada, os valores devem ser idênticos. Baseie-se em dados reais, não em estimativas aleatórias.
     
@@ -644,7 +649,7 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
       "is_packaged": bool 
     }}
     
-    is_precise: true se encontrou a marca exata.
+    is_precise: OBRIGATORIAMENTE false se você estiver "chutando" ou "estimando" sem uma fonte verificada (Search ou Tabela). true apenas se confirmado via pesquisa oficial ou itens genéricos padrão.
     verified_via_search: true se usou a ferramenta de pesquisa para validar.
     
     CONTEXTO: {history_ctx}
@@ -675,21 +680,19 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
         except Exception as e:
             logger.warning(f"Gemini Vision falhou: {e}. Indo para Fallback...")
     else:
-        # Para texto, agora também usamos Gemini 2.0 Flash se parecer um produto de marca
-        is_branded = any(brand in message_text.lower() for brand in ["marca", "paderri", "nestle", "bauducco", "coca", "sadia", "perdigao"])
+        # Padrões que sugerem necessidade de pesquisa (marcas, produtos específicos, descrições longas)
+        search_keywords = ["marca", "paderri", "nestle", "bauducco", "coca", "sadia", "perdigao", "danone", "heineken", "ambev", "swift", "sear"]
+        is_branded = any(k in message_text.lower() for k in search_keywords) or len(message_text.split()) > 5
         
         if is_branded:
-            logger.info("ROTA TEXTO (MARCA): IA Especialista (Gemini 2.0 Flash) + Search...")
+            logger.info("ROTA TEXTO (MARCA/SEARCH): IA Especialista (Gemini 2.0 Flash) + Search...")
             config = ai_types.GenerateContentConfig(
                 tools=[ai_types.Tool(google_search=ai_types.GoogleSearch())],
                 temperature=0.1
             )
             try:
-                response = await ai_client.aio.models.generate_content(
-                    model=AI_MODEL,
-                    contents=[prompt],
-                    config=config
-                )
+                # Unificando para usar o helper com retry e config
+                response = await call_gemini_with_retry([prompt], config=config)
                 raw_text = response.text
                 ai_success = True
             except Exception as e:

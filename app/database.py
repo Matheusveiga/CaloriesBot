@@ -29,8 +29,25 @@ def log_calories(user_id: str, user_name: str, items: list):
         return False
 
 def save_to_universal_catalog(item: dict):
-    """Saves a verified food item to the universal catalog (user_id='SYSTEM')."""
-    return log_calories("SYSTEM", "FatSecret Cache", [item])
+    """Saves a verified food item to the universal catalog (user_id='SYSTEM') if not already exists."""
+    try:
+        # Verifica se já existe no catálogo universal (SYSTEM) com o mesmo nome exato
+        food_name = item.get("alimento")
+        check = supabase.table("logs") \
+            .select("id") \
+            .eq("user_id", "SYSTEM") \
+            .eq("food", food_name) \
+            .limit(1) \
+            .execute()
+            
+        if check.data:
+            logger.info(f"⏭️ Item '{food_name}' já existe no catálogo universal. Pulando salvamento.")
+            return True
+            
+        return log_calories("SYSTEM", "FatSecret Cache", [item])
+    except Exception as e:
+        logger.error(f"Erro ao verificar/salvar no catálogo universal: {e}")
+        return False
 
 def get_user_profile(user_id: str):
     """Fetches the user's profile and TDEE."""
@@ -127,6 +144,18 @@ def delete_entire_profile(user_id: str):
         return True
     except Exception as e:
         logger.error(f"Erro ao deletar perfil completo: {e}")
+        return False
+
+def delete_log_by_id(user_id: str, log_id: int):
+    """Deletes a specific log by its ID."""
+    try:
+        supabase.table("logs").delete() \
+            .eq("user_id", str(user_id)) \
+            .eq("id", log_id) \
+            .execute()
+        return True
+    except Exception as e:
+        logger.error(f"Erro ao deletar log por ID: {e}")
         return False
 
 def search_food_history(user_id: str, food_query: str):

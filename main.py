@@ -1,7 +1,7 @@
 import asyncio
 from fastapi import Request
 from aiogram.types import Update
-from app.config import app, bot, dp, WEBHOOK_URL, logger
+from app.config import app, bot, dp, WEBHOOK_URL, logger, http_client
 from app.utils import get_br_now, get_br_today_start
 from app.database import supabase
 # Import handlers to ensure they are registered
@@ -24,6 +24,11 @@ async def on_startup():
     await bot.set_webhook(url=f"{WEBHOOK_URL}/webhook")
     logger.info(f"Webhook set to {WEBHOOK_URL}/webhook")
     asyncio.create_task(reminder_loop())
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    await http_client.aclose()
+    logger.info("HTTP client closed.")
 
 async def reminder_loop():
     """Background task to send reminders to inactive users."""

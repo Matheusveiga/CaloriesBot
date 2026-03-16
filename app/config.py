@@ -8,6 +8,7 @@ from google import genai
 from supabase import create_client, Client
 from groq import AsyncGroq
 from fastapi import FastAPI
+import httpx
 
 load_dotenv()
 
@@ -50,6 +51,7 @@ dp = Dispatcher(storage=MemoryStorage())
 app = FastAPI()
 ai_client = genai.Client(api_key=GEMINI_KEY)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+http_client = httpx.AsyncClient(timeout=httpx.Timeout(10.0))
 
 groq_client = None
 if GROQ_API_KEY:

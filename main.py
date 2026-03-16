@@ -7,7 +7,7 @@ import re
 import asyncio
 import httpx
 from json import JSONDecodeError
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, UTC
 from typing import Dict, Any, List, Optional
 
 import matplotlib.pyplot as plt
@@ -26,7 +26,7 @@ from google.genai import types as ai_types
 from supabase import create_client, Client
 from dotenv import load_dotenv
 from groq import AsyncGroq
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 
 load_dotenv()
 
@@ -40,6 +40,7 @@ GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+SERPER_API_KEY = os.getenv("SERPER_API_KEY") # Novo: Google Search Real
 WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL")
 
 # Validation
@@ -81,15 +82,23 @@ async def get_embedding(text: str):
     """Generates a vector embedding for a piece of text using Gemini."""
     logger.info("📡 SERVIÇO: Usando Gemini Embedding para busca histórica...")
     try:
-        # Usando o nome completo do modelo e verificando se v1 resolve o erro de beta
+        # Tenta o modelo 004 com o prefixo correto
         res = await ai_client.aio.models.embed_content(
-            model='text-embedding-004',
+            model='models/text-embedding-004',
             contents=text
         )
         return res.embeddings[0].values
     except Exception as e:
-        logger.error(f"Erro ao gerar embedding: {e}")
-        return None
+        logger.warning(f"Erro no text-embedding-004: {e}. Tentando fallback para embedding-001...")
+        try:
+            res = await ai_client.aio.models.embed_content(
+                model='models/embedding-001',
+                contents=text
+            )
+            return res.embeddings[0].values
+        except Exception as e2:
+            logger.error(f"Apocalipse de Embedding: {e2}")
+            return None
 AI_MODEL = "gemini-2.0-flash" 
 AI_MODEL_FALLBACK = "gemini-1.5-flash" # Corrigido: gemini-3.1 não existe. 1.5-Flash tem cota maior.
 
@@ -174,11 +183,11 @@ async def generate_sarcastic_response(user_id: int, message_text: str):
 
 def get_br_now():
     """Returns the current datetime in Brazil (UTC-3)."""
-    return datetime.utcnow() - timedelta(hours=3)
+    return datetime.now(UTC) - timedelta(hours=3)
 
 def get_br_today_start():
     """Returns the start of today in Brazil (00:00:00) in ISO format with offset."""
-    return get_br_now().strftime("%Y-%m-%dT00:00:00-03:00")
+    return get_br_now().replace(hour=0, minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT00:00:00-03:00")
 
 # --- DB Logic ---
 
@@ -507,6 +516,55 @@ async def search_duckduckgo(query: str) -> str:
         logger.warning(f"Erro no DuckDuckGo Search: {e}")
         return "Falha ao realizar busca externa."
 
+async def generate_surgical_query(food_name: str) -> str:
+    """Uses Groq to transform a common name into a high-precision surgical query."""
+    if not groq_client: return food_name
+    
+    prompt = f"""
+    Transforme o nome do alimento/produto abaixo em uma QUERY DE PESQUISA CIRÚRGICA para encontrar a tabela nutricional oficial.
+    REGRAS:
+    - Priorize sites oficiais brasileiros (.com.br).
+    - Use operadores: "tabela nutricional" pão de forma site:visconti.com.br
+    - Se for marca, use operadore OR entre grandes supermercados (carrefour, paodeacucar) e o site da marca.
+    - Retorne APENAS a query, sem comentários.
+    
+    ALIMENTO: "{food_name}"
+    """
+    try:
+        res = await groq_client.chat.completions.create(
+            model="llama-3.1-8b-instant", # Modelo ultra rápido para queries
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return res.choices[0].message.content.strip().replace('"', '')
+    except:
+        return food_name
+
+async def search_serper(query: str) -> str:
+    """Performs a real Google Search via Serper.dev."""
+    if not SERPER_API_KEY:
+        return ""
+    
+    url = "https://google.serper.dev/search"
+    payload = json.dumps({"q": query, "gl": "br", "hl": "pt-br"})
+    headers = {
+        'X-API-KEY': SERPER_API_KEY,
+        'Content-Type': 'application/json'
+    }
+    
+    try:
+        logger.info(f"🌐 Iniciando Busca SERPER (Google): {query}")
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, headers=headers, data=payload, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                results = data.get('organic', [])[:3]
+                context = "\n".join([f"- {r.get('title')}: {r.get('snippet')}" for r in results])
+                return context
+            return ""
+    except Exception as e:
+        logger.warning(f"Erro no Serper Search: {e}")
+        return ""
+
 async def call_groq_fallback(message_text: str, image_bytes: Optional[bytes] = None, prompt: str = "", search_context: str = ""):
     """Calls Groq (Llama 3.3) as a fallback, optionally with search context."""
     if not groq_client:
@@ -694,9 +752,13 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
 
     if use_vision:
         logger.info("📡 ROTA IMAGEM: Usando Gemini Vision para análise...")
+        
+        # Gera query cirúrgica para o caso da IA precisar de search interno (Gemini 2.0 tool)
+        # O prompt já foi ajustado antes para priorizar tabelas oficiais
+        
         config = ai_types.GenerateContentConfig(
             tools=[ai_types.Tool(google_search=ai_types.GoogleSearch())],
-            temperature=0.1 # Mais determinístico
+            temperature=0.1
         )
         contents = [prompt]
         contents.append(ai_types.Part.from_bytes(data=image_bytes, mime_type='image/jpeg'))
@@ -714,18 +776,26 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
         
         # TEXTO: Sempre preferimos Groq para economizar Gemini "quente"
         if groq_client:
-            ddgs_context = ""
+            search_context = ""
             if is_branded:
-                logger.info("📡 ROTA TEXTO (PESQUISA): Usando DuckDuckGo + Groq (Llama 3.3)...")
-                ddgs_context = await search_duckduckgo(f"tabela nutricional {message_text}")
-            else:
-                logger.info("📡 ROTA TEXTO (DIRETA): Usando Groq (Llama 3.3)...")
+                # 1. Gera a query técnica (Cirúrgica)
+                surgical_query = await generate_surgical_query(message_text)
                 
+                # 2. Tenta Google Real (Serper) se houver chave
+                search_context = await search_serper(surgical_query)
+                
+                # 3. Fallback para DuckDuckGo (Bing) se Serper falhar
+                if not search_context:
+                    logger.info("📡 ROTA TEXTO (PESQUISA): Usando DuckDuckGo + Groq (Llama 3.3)...")
+                    search_context = await search_duckduckgo(surgical_query)
+                else:
+                    logger.info("📡 ROTA TEXTO (PESQUISA): Google Serper OK! Extraindo com Groq...")
+
             try:
-                raw_text = await call_groq_fallback(message_text, None, prompt, search_context=ddgs_context)
+                raw_text = await call_groq_fallback(message_text, None, prompt, search_context=search_context)
                 if raw_text:
                     ai_success = True
-                    if ddgs_context: logger.info("Resiliência DuckDuckGo + Groq bem sucedida!")
+                    if search_context: logger.info("Extração Cirúrgica Groq bem sucedida!")
             except Exception as e:
                 logger.warning(f"Groq falhou: {e}")
 

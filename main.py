@@ -26,6 +26,7 @@ from google.genai import types as ai_types
 from supabase import create_client, Client
 from dotenv import load_dotenv
 from groq import AsyncGroq
+from duckduckgo_search import DDGS
 
 load_dotenv()
 
@@ -78,7 +79,9 @@ def get_main_keyboard():
 
 async def get_embedding(text: str):
     """Generates a vector embedding for a piece of text using Gemini."""
+    logger.info("📡 SERVIÇO: Usando Gemini Embedding para busca histórica...")
     try:
+        # Usando o nome completo do modelo e verificando se v1 resolve o erro de beta
         res = await ai_client.aio.models.embed_content(
             model='text-embedding-004',
             contents=text
@@ -87,8 +90,8 @@ async def get_embedding(text: str):
     except Exception as e:
         logger.error(f"Erro ao gerar embedding: {e}")
         return None
-AI_MODEL = "gemini-2.0-flash" # Modelo primário (Visão/Texto em 2026)
-AI_MODEL_FALLBACK = "gemini-3.1-flash-lite-preview" # Modelo de alta RPD para fallback
+AI_MODEL = "gemini-2.0-flash" 
+AI_MODEL_FALLBACK = "gemini-1.5-flash" # Corrigido: gemini-3.1 não existe. 1.5-Flash tem cota maior.
 
 # Init Supabase
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -492,20 +495,37 @@ async def call_gemini_with_retry(contents, config=None, max_retries=3):
                 continue
             raise e
 
-async def call_groq_fallback(message_text: str, image_bytes: Optional[bytes] = None, prompt: str = ""):
-    """Calls Groq (Llama 3.2 Vision) as a fallback."""
+async def search_duckduckgo(query: str) -> str:
+    """Performs a text search via DuckDuckGo as a zero-cost fallback."""
+    try:
+        logger.info(f"🌐 Iniciando Busca DuckDuckGo: {query}")
+        with DDGS() as ddgs:
+            results = ddgs.text(query, max_results=3, region="br-pt")
+            context = "\n".join([f"- {r['title']}: {r['body']}" for r in results])
+            return context if context else "Nenhuma informação adicional encontrada via search."
+    except Exception as e:
+        logger.warning(f"Erro no DuckDuckGo Search: {e}")
+        return "Falha ao realizar busca externa."
+
+async def call_groq_fallback(message_text: str, image_bytes: Optional[bytes] = None, prompt: str = "", search_context: str = ""):
+    """Calls Groq (Llama 3.3) as a fallback, optionally with search context."""
     if not groq_client:
         return None
     
+    # Se houver contexto de busca (DDGS), injeta no prompt
+    if search_context:
+        full_prompt = f"DADOS VERIFICADOS (WEB):\n{search_context}\n\n{prompt}"
+    else:
+        full_prompt = prompt
+
     try:
         import base64
-        # Usamos o modelo mais rápido e versátil para texto
         model = "llama-3.3-70b-versatile" 
         messages = [
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": prompt},
+                    {"type": "text", "text": full_prompt},
                 ]
             }
         ]
@@ -673,7 +693,7 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
     ai_success = False
 
     if use_vision:
-        logger.info("ROTA IMAGEM: IA Especialista (Gemini 2.0 Flash) + Search...")
+        logger.info("📡 ROTA IMAGEM: Usando Gemini Vision para análise...")
         config = ai_types.GenerateContentConfig(
             tools=[ai_types.Tool(google_search=ai_types.GoogleSearch())],
             temperature=0.1 # Mais determinístico
@@ -692,32 +712,26 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
         search_keywords = ["marca", "paderri", "nestle", "bauducco", "coca", "sadia", "perdigao", "danone", "heineken", "ambev", "swift", "sear"]
         is_branded = any(k in message_text.lower() for k in search_keywords) or len(message_text.split()) > 5
         
-        if is_branded:
-            logger.info("ROTA TEXTO (MARCA/SEARCH): IA Especialista (Gemini 2.0 Flash) + Search...")
-            config = ai_types.GenerateContentConfig(
-                tools=[ai_types.Tool(google_search=ai_types.GoogleSearch())],
-                temperature=0.1
-            )
+        # TEXTO: Sempre preferimos Groq para economizar Gemini "quente"
+        if groq_client:
+            ddgs_context = ""
+            if is_branded:
+                logger.info("📡 ROTA TEXTO (PESQUISA): Usando DuckDuckGo + Groq (Llama 3.3)...")
+                ddgs_context = await search_duckduckgo(f"tabela nutricional {message_text}")
+            else:
+                logger.info("📡 ROTA TEXTO (DIRETA): Usando Groq (Llama 3.3)...")
+                
             try:
-                # Unificando para usar o helper com retry e config
-                response = await call_gemini_with_retry([prompt], config=config)
-                raw_text = response.text
-                ai_success = True
-            except Exception as e:
-                logger.warning(f"Gemini Text Search falhou: {e}")
-        
-        if not ai_success and groq_client:
-            logger.info("ROTA TEXTO: IA de Alta Velocidade (Groq)...")
-            try:
-                raw_text = await call_groq_fallback(message_text, None, prompt)
+                raw_text = await call_groq_fallback(message_text, None, prompt, search_context=ddgs_context)
                 if raw_text:
                     ai_success = True
+                    if ddgs_context: logger.info("Resiliência DuckDuckGo + Groq bem sucedida!")
             except Exception as e:
                 logger.warning(f"Groq falhou: {e}")
 
-    # UNIVERSAL FALLBACK: Se o caminho primário falhou, usa o 3.1 Lite
+    # UNIVERSAL FALLBACK: Se o caminho primário falhou e Groq tb não resolveu
     if not ai_success:
-        logger.warning("Caminho primário falhou. Tentando Fallback Universal: Gemini 3.1 Flash Lite...")
+        logger.warning("📡 ROTA FALLBACK: Usando Gemini Flash (Cota Alta/Fallback)...")
         config = ai_types.GenerateContentConfig() # Lite não precisa de search para fallback rápido
         contents = [prompt]
         if use_vision:

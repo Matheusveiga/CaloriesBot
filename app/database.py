@@ -7,7 +7,7 @@ def log_calories(user_id: str, user_name: str, items: list):
     try:
         prepared_data = []
         for item in items:
-            prepared_data.append({
+            entry = {
                 "food": item.get("alimento"),
                 "weight": item.get("peso"),
                 "kcal": item.get("calorias"),
@@ -18,9 +18,11 @@ def log_calories(user_id: str, user_name: str, items: list):
                 "is_precise": item.get("is_precise", False),
                 "confirmations": item.get("confirmations", 0),
                 "user_id": str(user_id),
-                "user_name": user_name,
-                "embedding": item.get("embedding")
-            })
+                "user_name": user_name
+            }
+            if item.get("embedding"):
+                entry["embedding"] = item.get("embedding")
+            prepared_data.append(entry)
         if prepared_data:
             supabase.table("logs").insert(prepared_data).execute()
         return True

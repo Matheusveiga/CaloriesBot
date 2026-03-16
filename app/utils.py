@@ -86,17 +86,19 @@ def extract_amount(text: str) -> Optional[float]:
 
 async def get_embedding(text: str):
     """Generates a vector embedding for a piece of text using Gemini."""
-    logger.info("📡 SERVIÇO: Usando Gemini Embedding para busca histórica...")
+    logger.info(f"📡 SERVIÇO: Gerando embedding para: {text[:20]}...")
     try:
+        # Tenta usar o modelo mais recente
         res = await ai_client.aio.models.embed_content(model='text-embedding-004', contents=text)
         return res.embeddings[0].values
     except Exception as e:
-        logger.warning(f"Erro no text-embedding-004: {e}. Tentando fallback embedding-001...")
+        logger.warning(f"Erro no text-embedding-004: {e}. Tentando fallback models/embedding-001...")
         try:
-            res = await ai_client.aio.models.embed_content(model='embedding-001', contents=text)
+            # Fallback com prefixo explícito caso o SDK precise
+            res = await ai_client.aio.models.embed_content(model='models/embedding-001', contents=text)
             return res.embeddings[0].values
         except Exception as e2:
-            logger.error(f"Apocalipse de Embedding: {e2}")
+            logger.error(f"Falha total de embedding: {e2}")
             return None
 
 def parse_numeric(text: str) -> Optional[float]:

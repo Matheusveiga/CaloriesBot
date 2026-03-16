@@ -107,7 +107,10 @@ class ProfileStates(StatesGroup):
     activity = State()
     goal = State() # NEW: Objetivo (Perder, Manter, Ganhar)
 class BarcodeState(StatesGroup):
-    waiting_for_portion = State() # Esperando o usuário dizer quanto comeu do produto escaneado
+    waiting_for_portion = State() 
+
+class CorrectionStates(StatesGroup):
+    kcal = State()
 
 # Memory and Duplicate protection
 processed_messages = set()
@@ -472,6 +475,14 @@ async def call_gemini_with_retry(contents, config=None, max_retries=3):
                 contents=contents,
                 config=config
             )
+            # Log if tool calls were used (like search)
+            if response.candidates:
+                for candidate in response.candidates:
+                    if candidate.content and candidate.content.parts:
+                        for part in candidate.content.parts:
+                            if hasattr(part, 'call_queries') and part.call_queries:
+                                logger.info(f"🔍 Gemini usou Ferramentas (Search): {part.call_queries}")
+            
             return response
         except Exception as e:
             if "429" in str(e) and i < max_retries - 1:
@@ -609,26 +620,21 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
     OBJETIVO: Identificar alimentos da "ENTRADA ATUAL", extraindo calorias, macronutrientes e o tipo de refeição.
     
     ESTRATÉGIA DE PESQUISA (CRÍTICO):
-    1. **MARCAS E PRODUTOS:** Se a entrada contiver marcas (ex: Paderrí, Nestlé, Bauducco, Coca-Cola) ou produtos específicos, **USE A FERRAMENTA DE PESQUISA DO GOOGLE** para encontrar a tabela nutricional OFICIAL.
-    2. **PRIORIDADE DE DADOS:** 
-       - 1º: Tabela nutricional oficial encontrada via pesquisa.
-       - 2º: Tabela nutricional visível na imagem (se houver).
-       - 3º: Conhecimento interno para itens genéricos (ex: maçã, arroz branco).
-    3. **BASE 100G/ML (Obrigatório):** Independentemente da porção que você encontrar, **RETORNE SEMPRE OS VALORES PARA 100g ou 100ml**. 
-       - Exemplo: Se o crepe Paderrí tem 111kcal em 30g, você deve calcular (111 / 30 * 100) = ~370kcal.
-    PESQUISA DE PORÇÕES (ITENS IN NATURA/GRANEL):
-    Se o usuário não especificar gramas/ml para itens comuns (ex: "um pão francês", "uma maçã", "duas bananas"):
-    1. **PESQUISE NO GOOGLE** o "peso médio usual de uma unidade no Brasil".
-    2. Use a média encontrada via pesquisa para o cálculo.
-    3. Padrões conhecidos para referência rápida: Pão Francês (~50g), Ovo (~50g), Banana (~80-100g). Na dúvida, PESQUISE em vez de chutar.
-       - Macros (P, C, G) também devem ser convertidos para a base 100.
-    4. **COERÊNCIA:** Se o usuário desfizer e refazer a mesma entrada, os valores devem ser idênticos. Baseie-se em dados reais, não em estimativas aleatórias.
+    1. **TABELA OFICIAL (PRIORIDADE 1):** Procure prioritariamente por sites de FABRICANTES (.com.br, nestle.com, etc) ou catálogos oficiais de grandes supermercados.
+    2. **PESQUISA POR TABELA:** Use termos como "tabela nutricional oficial [produto]" para evitar blogs de terceiros imprecisos.
+    3. **QUANDO NÃO ACHAR TABELA (INCIDÊNCIA):** Se não houver fonte oficial, pesquise e use o valor com mais recorrência/incidência estatística na web (consenso).
+    4. **MARCAS E PRODUTOS:** Para marcas (ex: Paderrí, Nestlé), **USE O GOOGLE SEARCH**.
+    
+    PESQUISA DE PORÇÕES DINÂMICA:
+    Para itens in natura/granel sem peso (ex: "uma maçã"):
+    1. Pesquise o "peso médio usual de uma unidade no Brasil".
+    2. Maçã (~130-150g), Banana (~80-100g), Pão Francês (~50g). Na dúvida entre fontes, use a média da pesquisa.
     
     REGRAS DE EXTRAÇÃO:
     5. **PÓ vs PREPARADO:** Para alimentos que exigem preparo, assuma o peso do produto PRONTO.
     6. **MEDIDAS CASEIRAS:** Converta automaticamente (1 colher sopa = 15g, 1 xícara = 200ml, 1 fatia = 30g).
     7. Classifique a REFEIÇÃO ({hora_local}: 05-10:30 Café, 11-14:30 Almoço, 18-23 Jantar, outros: Lanche).
-    8. **FRAÇÕES:** Se o usuário disser "meio" ou "1/2", o campo `peso` deve refletir isso (ex: "meio crepe" de 30g -> 15g).
+    8. **FRAÇÕES E UNIDADES:** Se o usuário disser "meio" ou "1/2", ou usar unidades do catálogo acima, o campo `peso` deve refletir o cálculo (ex: "meio pão francês" -> 25g). Se o alimento não estiver no catálogo e não houver peso, use 100g como fallback genérico.
     
     OUTPUT JSON:
     {{ 
@@ -642,15 +648,17 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
           "gorduras": int_base_100, 
           "refeicao": "str", 
           "is_precise": bool,
-          "verified_via_search": bool
+          "verified_via_search": bool,
+          "table_detected": bool
         }} 
       ], 
       "barcode": "string_or_null", 
       "is_packaged": bool 
     }}
     
-    is_precise: OBRIGATORIAMENTE false se você estiver "chutando" ou "estimando" sem uma fonte verificada (Search ou Tabela). true apenas se confirmado via pesquisa oficial ou itens genéricos padrão.
-    verified_via_search: true se usou a ferramenta de pesquisa para validar.
+    is_precise: OBRIGATORIAMENTE false se estiver estimando.
+    verified_via_search: true se usou a ferramenta de pesquisa.
+    table_detected: true se encontrou e leu valores de uma tabela nutricional oficial (na imagem ou via search).
     
     CONTEXTO: {history_ctx}
     ENTRADA ATUAL: "{message_text}"
@@ -752,7 +760,8 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
                 item["gorduras"] = int(float(item.get("gorduras", 0)))
                 # Preserve flags
                 item["is_precise"] = bool(item.get("is_precise", False))
-                item["is_universal"] = bool(item.get("verified_via_search", False)) # Use research as universal proof
+                item["is_universal"] = bool(item.get("verified_via_search", False))
+                item["table_detected"] = bool(item.get("table_detected", False))
                 sanitized_items.append(item)
 
         # Guarda de plausibilidade simples para evitar outliers absurdos
@@ -1089,6 +1098,79 @@ async def process_confirm_precise(callback: types.CallbackQuery):
     except Exception as e:
         logger.error(f"Erro ao votar precisão: {e}")
         await callback.answer("❌ Erro ao processar voto.")
+
+@dp.callback_query(F.data == "manual_correct")
+async def process_manual_correction_start(callback: types.CallbackQuery, state: FSMContext):
+    """Starts the manual kcal correction flow."""
+    await callback.answer()
+    await callback.message.answer(
+        "📝 **Correção Manual**\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Qual o valor real de **calorias (kcal) para cada 100g** desse alimento?\n\n"
+        "*(Basta digitar o número, ex: 350. Eu calcularei o total baseado no peso do log original)*",
+        parse_mode="Markdown"
+    )
+    await state.set_state(CorrectionStates.kcal)
+
+@dp.message(CorrectionStates.kcal)
+async def process_manual_kcal(message: types.Message, state: FSMContext):
+    """Processes the manual kcal input and updates the last log."""
+    kcal_100g = parse_numeric(message.text)
+    if kcal_100g is None:
+        await message.answer("❌ **Valor inválido.** Por favor, digite apenas o número das calorias por 100g.")
+        return
+
+    user_id = message.from_user.id
+    try:
+        # Busca o último log para pegar o peso
+        res = supabase.table("logs") \
+            .select("*") \
+            .eq("user_id", str(user_id)) \
+            .order("created_at", desc=True) \
+            .limit(1) \
+            .execute()
+        
+        if not res.data:
+            await message.answer("❌ Não encontrei registros recentes para corrigir.")
+            await state.clear()
+            return
+            
+        last_item = res.data[0]
+        weight_str = last_item.get("weight", "100g")
+        grams = extract_amount(weight_str) or 100
+        
+        # Recalcula kcal total baseado na base 100 informada
+        new_kcal = round((kcal_100g / 100) * grams)
+        
+        # Atualiza no DB
+        supabase.table("logs").update({
+            "kcal": new_kcal,
+            "is_precise": True # Agora é preciso pois o usuário informou
+        }).eq("id", last_item["id"]).execute()
+        
+        await state.clear()
+        
+        # Feedback de sucesso e resumo atualizado
+        stats = get_daily_stats(user_id)
+        profile = get_user_profile(user_id)
+        limit = profile['tdee'] if profile else 2000
+        progress = min(10, round((stats['kcal']/limit)*10)) if limit > 0 else 0
+        p_bar = "🔵" * progress + "⚪" * (10 - progress)
+
+        await message.answer(
+            f"✅ **Valor corrigido com sucesso!**\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🍎 **{last_item['food']}**\n"
+            f"⚖️ {weight_str} | 🔥 **{new_kcal} kcal** (atualizado)\n\n"
+            f"🔥 **Consumo Total Hoje:** {stats['kcal']} / {limit} kcal\n"
+            f"|{p_bar}|",
+            parse_mode="Markdown"
+        )
+        
+    except Exception as e:
+        logger.error(f"Erro na correção manual: {e}")
+        await message.answer("❌ Erro ao processar a correção.")
+        await state.clear()
 
 @dp.callback_query(F.data.startswith("err_"))
 async def process_error_actions(callback: types.CallbackQuery):
@@ -1454,6 +1536,12 @@ async def process_food_entry(message: types.Message, items: list, raw_data: str)
     stats = get_daily_stats(message.from_user.id)
     daily_total = stats["kcal"]
     
+    table_detected = any(i.get("table_detected", False) for i in items)
+    prefix = "✅ **Tabela Nutricional Detectada**\n" if table_detected else ""
+    
+    msg = f"{prefix}✅ **Registro Confirmado!**\n"
+    msg += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    
     items_text = ""
     for idx, i in enumerate(items):
         meal_header = i.get('refeicao', 'Lanche').upper()
@@ -1480,9 +1568,13 @@ async def process_food_entry(message: types.Message, items: list, raw_data: str)
         [InlineKeyboardButton(text="🔄 Desfazer", callback_data="adj_undo")]
     ]
     
-    # Se houver itens estimados, oferece o botão de votar
+    # Se houver itens estimados, oferece o botão de votar e o de corrigir
     if any(not i.get("is_precise", False) for i in items):
-        buttons.insert(0, [InlineKeyboardButton(text="🗳️ Votar como Correto", callback_data="confirm_precise")])
+        row = [InlineKeyboardButton(text="🗳️ Votar Correto", callback_data="confirm_precise")]
+        # Só permite corrigir se NÃO detectou tabela (tabela é absoluto)
+        if not table_detected:
+            row.append(InlineKeyboardButton(text="🎨 Corrigir", callback_data="manual_correct"))
+        buttons.insert(0, row)
         
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
 

@@ -1,31 +1,31 @@
 import asyncio
 from fastapi import Request
 from aiogram.types import Update
-from app.config import app, bot, dp, WEBHOOK_URL, logger, http_client
+from app.config import fastapi_app as app, bot, dp, WEBHOOK_URL, logger, http_client
 from app.utils import get_br_now, get_br_today_start
 from app.database import supabase
 # Import handlers to ensure they are registered
 import app.bot_handlers
 
-@app.post("/webhook")
+@fastapi_app.post("/webhook")
 async def telegram_webhook(request: Request):
     update = Update.model_validate(await request.json(), context={"bot": bot})
     await dp.feed_update(bot, update)
     return {"status": "ok"}
 
-@app.get("/")
+@fastapi_app.get("/")
 def index(): return {"status": "CaloriesBot is running"}
 
-@app.api_route("/api/health", methods=["GET", "POST", "HEAD"])
+@fastapi_app.api_route("/api/health", methods=["GET", "POST", "HEAD"])
 def health_check(): return {"status": "ok"}
 
-@app.on_event("startup")
+@fastapi_app.on_event("startup")
 async def on_startup():
     await bot.set_webhook(url=f"{WEBHOOK_URL}/webhook")
     logger.info(f"Webhook set to {WEBHOOK_URL}/webhook")
     asyncio.create_task(reminder_loop())
 
-@app.on_event("shutdown")
+@fastapi_app.on_event("shutdown")
 async def on_shutdown():
     await http_client.aclose()
     logger.info("HTTP client closed.")
@@ -54,4 +54,4 @@ async def reminder_loop():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run("main:fastapi_app", host="0.0.0.0", port=8000, reload=True)

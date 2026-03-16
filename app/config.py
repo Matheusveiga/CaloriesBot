@@ -48,7 +48,7 @@ if not SUPABASE_URL.startswith("https://"):
 # Init Clients
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
-app = FastAPI()
+fastapi_app = FastAPI()
 ai_client = genai.Client(api_key=GEMINI_KEY)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 http_client = httpx.AsyncClient(timeout=httpx.Timeout(10.0))

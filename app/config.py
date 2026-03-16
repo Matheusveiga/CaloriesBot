@@ -34,6 +34,8 @@ if not GEMINI_KEY: missing_vars.append("GEMINI_API_KEY")
 if not SUPABASE_URL: missing_vars.append("SUPABASE_URL")
 if not SUPABASE_KEY: missing_vars.append("SUPABASE_KEY")
 if not WEBHOOK_URL: missing_vars.append("RENDER_EXTERNAL_URL")
+if not FATSECRET_CLIENT_ID: missing_vars.append("FATSECRET_CLIENT_ID")
+if not FATSECRET_CLIENT_SECRET: missing_vars.append("FATSECRET_CLIENT_SECRET")
 
 if missing_vars:
     error_msg = f"❌ Faltando variáveis de ambiente: {', '.join(missing_vars)}"

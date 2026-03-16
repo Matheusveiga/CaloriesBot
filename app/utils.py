@@ -22,8 +22,7 @@ def is_jailbreak(text: str) -> bool:
         r"developer mode.*enabled",
         r"ignore all.*instructions",
         r"system message",
-        r"jailbreak",
-        r"caloriesbot"
+        r"jailbreak"
     ]
     for p in patterns:
         if re.search(p, text_lower):

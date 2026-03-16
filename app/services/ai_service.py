@@ -24,8 +24,6 @@ async def call_gemini_with_retry(contents, config=None, max_retries=3):
                 continue
             raise e
 
-            raise e
-
 async def call_groq_fallback(message_text: str, image_bytes=None, prompt: str = "", search_context: str = ""):
     """Calls Groq (Llama 3.3) as a fallback, optionally with search context."""
     if not groq_client: return None
@@ -83,10 +81,34 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
                 return db_match, None, None, None, "DB_VERIFIED_CACHE"
 
     prompt = f"""
-    Você é um nutricionista especialista de ELITE. 
-    OBJETIVO: Identificar alimentos da "ENTRADA ATUAL", extraindo calorias, macronutrientes e o tipo de refeição.
-    (Regras de pesquisa e extração idênticas ao original...)
-    CONTEXTO: {history_ctx}
+    Você é um nutricionista especialista de ELITE com visão computacional avançada.
+    OBJETIVO: Identificar alimentos da "ENTRADA ATUAL", extraindo calorias, proteínas, carboidratos e gorduras.
+    
+    ### REGRAS DE OURO (Siga rigorosamente):
+    1.  **ESTRUTURA JSON**: Retorne APENAS um objeto JSON válido seguindo este esquema:
+        {{
+          "items": [
+            {{
+              "alimento": "Nome do alimento (inclua marca se for industrializado)",
+              "peso": "Peso estimado (ex: '150g', '200ml')",
+              "calorias": Int (BASE 100g/ml),
+              "proteina": Int (BASE 100g/ml),
+              "carboidratos": Int (BASE 100g/ml),
+              "gorduras": Int (BASE 100g/ml),
+              "refeicao": "Café, Almoço, Jantar, Lanche ou Outro",
+              "is_precise": Boolean (True se leu de tabela/marca exata)
+            }}
+          ],
+          "barcode": "String ou null",
+          "is_packaged": Boolean (True se for embalagem industrializada)
+        }}
+    
+    2.  **CONVERSÃO BASE 100**: Se encontrar dados específicos (ex: 30g), calcule o valor proporcional para 100g/ml antes de preencher o JSON.
+    3.  **VISÃO (Se houver imagem)**: Foque primeiro em ler a **Tabela Nutricional** se houver.
+    4.  **REFEIÇÃO**: Classifique com base na hora ({hora_local}). 
+    5.  **CONTEXTO**: Use o histórico para entender se este item é uma correção ou adição.
+    
+    HISTÓRICO: {history_ctx}
     ENTRADA ATUAL: "{message_text}"
     """
     # Note: Full prompt content preserved from main.py
@@ -174,7 +196,13 @@ def calculate_tdee(w, h, a, g, act, goal="manter"):
     return round(tdee)
 
 async def generate_sarcastic_response(user_id: int, message_text: str):
-    prompt = f"Você é o CaloriesBot... (Sarcasmo prompt...)\nUSUÁRIO DISSE: \"{message_text}\""
+    prompt = f"""
+    Você é o CaloriesBot, um assistente de dieta passivo-agressivo, sarcástico e levemente julgador. 
+    O usuário disse algo que não é um alimento ou uma tentativa de burlar seu sistema.
+    Responda com sarcasmo fino, usando emojis, de forma curta e engraçada.
+    
+    USUÁRIO DISSE: "{message_text}"
+    """
     try:
         response = await ai_client.aio.models.generate_content(model=AI_MODEL, contents=[prompt])
         return response.text.strip()

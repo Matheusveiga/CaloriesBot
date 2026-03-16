@@ -1,31 +1,49 @@
 import asyncio
 from fastapi import Request
 from aiogram.types import Update
-from app.config import fastapi_app as app, bot, dp, WEBHOOK_URL, logger, http_client
+from app.config import fastapi_app as app, bot, dp, WEBHOOK_URL, logger, http_client, processed_messages
 from app.utils import get_br_now, get_br_today_start
 from app.database import supabase
 # Import handlers to ensure they are registered
 import app.bot_handlers
 
-@fastapi_app.post("/webhook")
+@app.post("/webhook")
 async def telegram_webhook(request: Request):
-    update = Update.model_validate(await request.json(), context={"bot": bot})
-    await dp.feed_update(bot, update)
-    return {"status": "ok"}
+    try:
+        body = await request.json()
+        update = Update.model_validate(body, context={"bot": bot})
+        
+        # Deduplicação baseada em update_id
+        if update.update_id in processed_messages:
+            return {"status": "already_processed"}
+            
+        processed_messages.add(update.update_id)
+        if len(processed_messages) > 1000:
+            # Mantém apenas as últimas 1000 IDs
+            list_ids = list(processed_messages)
+            processed_messages.clear()
+            for id in list_ids[-500:]:
+                processed_messages.add(id)
 
-@fastapi_app.get("/")
+        await dp.feed_update(bot, update)
+        return {"status": "ok"}
+    except Exception as e:
+        logger.error(f"Erro no webhook: {e}")
+        return {"status": "error"}
+
+@app.get("/")
 def index(): return {"status": "CaloriesBot is running"}
 
-@fastapi_app.api_route("/api/health", methods=["GET", "POST", "HEAD"])
+@app.api_route("/api/health", methods=["GET", "POST", "HEAD"])
 def health_check(): return {"status": "ok"}
 
-@fastapi_app.on_event("startup")
+@app.on_event("startup")
 async def on_startup():
     await bot.set_webhook(url=f"{WEBHOOK_URL}/webhook")
     logger.info(f"Webhook set to {WEBHOOK_URL}/webhook")
     asyncio.create_task(reminder_loop())
 
-@fastapi_app.on_event("shutdown")
+@app.on_event("shutdown")
 async def on_shutdown():
     await http_client.aclose()
     logger.info("HTTP client closed.")
@@ -54,4 +72,4 @@ async def reminder_loop():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:fastapi_app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

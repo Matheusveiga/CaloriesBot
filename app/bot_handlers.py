@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, UTC
 from typing import Dict, Any, List, Optional
 from PIL import Image
 import matplotlib.pyplot as plt
+plt.switch_backend('Agg')
 from aiogram import types, F
 from aiogram.filters import Command, StateFilter, CommandObject
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton

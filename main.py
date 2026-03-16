@@ -4,8 +4,8 @@ from aiogram.types import Update
 from app.config import fastapi_app as app, bot, dp, WEBHOOK_URL, logger, http_client, processed_messages
 from app.utils import get_br_now, get_br_today_start
 from app.database import supabase
-# Import handlers to ensure they are registered
-import app.bot_handlers
+# Import handlers using 'from app import' to avoid package name collision
+from app import bot_handlers
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request):

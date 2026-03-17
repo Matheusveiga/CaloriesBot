@@ -3,7 +3,7 @@ import asyncio
 from google.genai import types as ai_types
 from app.config import logger, ai_client, groq_client, AI_MODEL, AI_MODEL_FALLBACK, user_history, AI_CACHE, supabase
 from app.utils import get_br_now, extract_amount, get_embedding
-from app.database import search_food_history
+from app.database import search_food_history, search_universal_catalog
 from app.services.search_service import search_fatsecret, search_serper, search_duckduckgo, generate_surgical_query
 
 async def call_gemini_with_retry(contents, config=None, max_retries=3):
@@ -48,8 +48,15 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
     cache_key = f"{message_text}_{image_bytes is not None}"
 
     if not image_bytes:
-        # Cache Semântico
+        # 1. Busca Semântica no NOVO Catálogo Universal (Prioridade Máxima)
         embedding = await get_embedding(message_text)
+        if embedding:
+            cat_match = search_universal_catalog(embedding)
+            if cat_match:
+                logger.info(f"🧠 Catálogo Universal (Semântico): {message_text} -> {cat_match[0]['alimento']}")
+                return cat_match, None, None, None, "UNIVERSAL_CATALOG_MATCH"
+
+        # 2. Cache Semântico Pessoal (Histórico do Usuário)
         if embedding:
             try:
                 match_res = supabase.rpc("match_logs", {

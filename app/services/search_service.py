@@ -10,13 +10,13 @@ async def get_fatsecret_token():
     """Retrieves and caches an OAuth 2.0 token for the FatSecret API."""
     global fs_token
     import time
+    from app.config import get_fs_client
     now = time.time()
     
     if fs_token.get("access_token") and now < fs_token.get("expires_at", 0):
         return fs_token["access_token"]
     
     async with fs_lock:
-        # Check again inside lock
         if fs_token.get("access_token") and now < fs_token.get("expires_at", 0):
             return fs_token["access_token"]
 
@@ -28,23 +28,30 @@ async def get_fatsecret_token():
         data = {"grant_type": "client_credentials", "scope": "basic"}
         auth = (FATSECRET_CLIENT_ID, FATSECRET_CLIENT_SECRET)
         
-        try:
-            logger.info("📡 FatSecret: Solicitando novo token OAuth 2.0...")
-            response = await http_client.post(url, data=data, auth=auth)
-            if response.status_code == 200:
-                res_data = response.json()
-                fs_token["access_token"] = res_data["access_token"]
-                fs_token["expires_at"] = now + res_data["expires_in"] - 60
-                logger.info("✅ FatSecret: Token obtido com sucesso.")
-                return fs_token["access_token"]
-            else:
-                logger.error(f"❌ FatSecret Token Error ({response.status_code}): {response.text}")
-        except Exception as e:
-            logger.error(f"❌ Erro ao obter token FatSecret: {e}")
+        # Try with up to 3 different proxies if there's a connection error
+        max_retries = 3 if FATSECRET_PROXIES else 1
+        for attempt in range(max_retries):
+            client = get_fs_client()
+            try:
+                logger.info(f"📡 FatSecret Token: Tentativa {attempt+1} (Proxy: {getattr(client, 'proxies', 'None')})")
+                response = await client.post(url, data=data, auth=auth)
+                if response.status_code == 200:
+                    res_data = response.json()
+                    fs_token["access_token"] = res_data["access_token"]
+                    fs_token["expires_at"] = now + res_data["expires_in"] - 60
+                    logger.info("✅ FatSecret: Token obtido com sucesso.")
+                    return fs_token["access_token"]
+                else:
+                    logger.error(f"❌ FatSecret Token Error ({response.status_code}): {response.text}")
+            except Exception as e:
+                logger.warning(f"⚠️ Erro ao obter token FatSecret (Tentativa {attempt+1}): {e}")
+            finally:
+                if client is not http_client: await client.aclose()
     return None
 
 async def search_fatsecret(food_name: str) -> str:
     """Searches the FatSecret database for nutritional information."""
+    from app.config import get_fs_client
     token = await get_fatsecret_token()
     if not token: return ""
         
@@ -58,69 +65,75 @@ async def search_fatsecret(food_name: str) -> str:
     }
     headers = {"Authorization": f"Bearer {token}"}
     
-    try:
-        logger.info(f"📡 FatSecret Search: {food_name}")
-        response = await http_client.get(url, params=params, headers=headers)
-        
-        if response.status_code != 200:
-            logger.error(f"❌ FatSecret Search API Error ({response.status_code}): {response.text}")
-            return ""
+    # Try with proxy rotation
+    max_retries = 3 if FATSECRET_PROXIES else 1
+    for attempt in range(max_retries):
+        client = get_fs_client()
+        try:
+            logger.info(f"📡 FatSecret Search: {food_name} (Attempt {attempt+1})")
+            response = await client.get(url, params=params, headers=headers)
             
-        data = response.json()
-        if "error" in data:
-            logger.error(f"❌ FatSecret Search Logic Error: {data['error'].get('message')}")
-            return ""
+            if response.status_code != 200:
+                logger.error(f"❌ FatSecret Search API Error ({response.status_code}): {response.text}")
+                continue # Try next proxy
+                
+            data = response.json()
+            if "error" in data:
+                logger.error(f"❌ FatSecret Search Logic Error: {data['error'].get('message')}")
+                return ""
+                
+            foods = data.get("foods", {}).get("food", [])
+            if not foods: return ""
             
-        foods = data.get("foods", {}).get("food", [])
-        if not foods: return ""
-        
-        food_id = foods[0]["food_id"]
-        detail_params = {"method": "food.get.v2", "food_id": food_id, "format": "json"}
-        detail_res = await http_client.get(url, params=detail_params, headers=headers)
-        
-        if detail_res.status_code != 200:
-            logger.error(f"❌ FatSecret Detail API Error ({detail_res.status_code}): {detail_res.text}")
-            return ""
+            food_id = foods[0]["food_id"]
+            detail_params = {"method": "food.get.v2", "food_id": food_id, "format": "json"}
+            detail_res = await client.get(url, params=detail_params, headers=headers)
             
-        detail_data = detail_res.json()
-        if "error" in detail_data:
-            logger.error(f"❌ FatSecret Detail Logic Error: {detail_data['error'].get('message')}")
-            return ""
+            if detail_res.status_code != 200:
+                logger.error(f"❌ FatSecret Detail API Error ({detail_res.status_code}): {detail_res.text}")
+                continue
+                
+            detail_data = detail_res.json()
+            if "error" in detail_data:
+                logger.error(f"❌ FatSecret Detail Logic Error: {detail_data['error'].get('message')}")
+                return ""
+                
+            d = detail_data.get("food", {})
+            name = d.get("food_name", "")
+            servings = d.get("servings", {}).get("serving", [])
+            if isinstance(servings, dict): servings = [servings]
             
-        d = detail_data.get("food", {})
-        name = d.get("food_name", "")
-        servings = d.get("servings", {}).get("serving", [])
-        if isinstance(servings, dict): servings = [servings]
-        
-        s_100 = next((s for s in servings if s.get("metric_serving_amount") == "100.000"), servings[0])
-        
-        # Persistência (Redundância)
-        from app.database import save_to_universal_catalog
-        from app.utils import get_embedding
-        
-        embedding = await get_embedding(name)
-        save_to_universal_catalog({
-            "alimento": name,
-            "peso": "100g", # Base FatSecret
-            "calorias": float(s_100.get('calories', 0)),
-            "proteina": float(s_100.get('protein', 0)),
-            "carboidratos": float(s_100.get('carbohydrate', 0)),
-            "gorduras": float(s_100.get('fat', 0)),
-            "is_precise": True,
-            "confirmations": 10,
-            "embedding": embedding
-        })
-        
-        context = f"DADO VERIFICADO (FatSecret): {name}\n"
-        context += f"- Calorias: {s_100.get('calories')} kcal\n"
-        context += f"- Carboidratos: {s_100.get('carbohydrate')}g\n"
-        context += f"- Proteínas: {s_100.get('protein')}g\n"
-        context += f"- Gorduras: {s_100.get('fat')}g\n"
-        context += f"(Valores por {s_100.get('metric_serving_amount')}{s_100.get('metric_serving_unit')})"
-        return context
-    except Exception as e:
-        logger.warning(f"Erro no FatSecret Search: {e}")
-        return ""
+            s_100 = next((s for s in servings if s.get("metric_serving_amount") == "100.000"), servings[0])
+            
+            # Persistência
+            from app.database import save_to_universal_catalog
+            from app.utils import get_embedding
+            
+            embedding = await get_embedding(name)
+            save_to_universal_catalog({
+                "alimento": name,
+                "peso": "100g",
+                "calorias": float(s_100.get('calories', 0)),
+                "proteina": float(s_100.get('protein', 0)),
+                "carboidratos": float(s_100.get('carbohydrate', 0)),
+                "gorduras": float(s_100.get('fat', 0)),
+                "is_precise": True,
+                "confirmations": 10,
+                "embedding": embedding
+            })
+            
+            context = f"DADO VERIFICADO (Catálogo): {name}\n"
+            context += f"- Calorias: {s_100.get('calories')} kcal\n"
+            context += f"- Carboidratos: {s_100.get('carbohydrate')}g\n"
+            context += f"- Proteínas: {s_100.get('protein')}g\n"
+            context += f"- Gorduras: {s_100.get('fat')}g\n"
+            context += f"(Valores por {s_100.get('metric_serving_amount')}{s_100.get('metric_serving_unit')})"
+            return context
+        except Exception as e:
+            logger.warning(f"Erro no FatSecret Search (Tentativa {attempt+1}): {e}")
+        finally:
+            if client is not http_client: await client.aclose()
+    return ""
 
 async def search_serper(query: str) -> str:
     """Performs a real Google Search via Serper.dev."""

@@ -31,25 +31,66 @@ def log_calories(user_id: str, user_name: str, items: list):
         return False
 
 def save_to_universal_catalog(item: dict):
-    """Saves a verified food item to the universal catalog (user_id='SYSTEM') if not already exists."""
+    """Saves a verified food item to the dedicated universal_catalog table."""
     try:
-        # Verifica se já existe no catálogo universal (SYSTEM) com o mesmo nome exato
         food_name = item.get("alimento")
-        check = supabase.table("logs") \
+        # Verifica duplicata na tabela nova
+        check = supabase.table("universal_catalog") \
             .select("id") \
-            .eq("user_id", "SYSTEM") \
             .eq("food", food_name) \
             .limit(1) \
             .execute()
             
         if check.data:
-            logger.info(f"⏭️ Item '{food_name}' já existe no catálogo universal. Pulando salvamento.")
+            logger.info(f"⏭️ Item '{food_name}' já existe no catálogo universal. Pulando.")
             return True
             
-        return log_calories("SYSTEM", "FatSecret Cache", [item])
+        data = {
+            "food": food_name,
+            "kcal": float(item.get("calorias", 0)),
+            "protein": float(item.get("proteina", 0)),
+            "carbs": float(item.get("carboidratos", 0)),
+            "fat": float(item.get("gorduras", 0)),
+            "serving_size": item.get("peso", "100g"),
+            "embedding": item.get("embedding"),
+            "confirmations": item.get("confirmations", 1),
+            "is_precise": item.get("is_precise", True)
+        }
+        
+        supabase.table("universal_catalog").insert(data).execute()
+        logger.info(f"✅ Item '{food_name}' salvo no NOVO Catálogo Universal.")
+        return True
     except Exception as e:
-        logger.error(f"Erro ao verificar/salvar no catálogo universal: {e}")
+        logger.error(f"Erro ao salvar no catálogo universal: {e}")
         return False
+
+def search_universal_catalog(query_embedding: list, threshold: float = 0.8):
+    """Performs semantic search in the dedicated universal_catalog table."""
+    try:
+        # RPC call for the match_food_catalog function created in SQL
+        res = supabase.rpc("match_food_catalog", {
+            "query_embedding": query_embedding,
+            "match_threshold": threshold,
+            "match_count": 1
+        }).execute()
+        
+        if res.data:
+            item = res.data[0]
+            return [{
+                "alimento": item["food"],
+                "peso": item["serving_size"],
+                "calorias": item["kcal"],
+                "proteina": item["protein"],
+                "carboidratos": item["carbs"],
+                "gorduras": item["fat"],
+                "is_precise": True,
+                "is_universal": True,
+                "similarity": item["similarity"]
+            }]
+        return None
+    except Exception as e:
+        logger.error(f"Erro na busca vetorial do catálogo: {e}")
+        return None
 
 def get_user_profile(user_id: str):
     """Fetches the user's profile and TDEE."""

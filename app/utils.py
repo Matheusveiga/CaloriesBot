@@ -88,18 +88,17 @@ async def get_embedding(text: str):
     """Generates a vector embedding for a piece of text using Gemini."""
     logger.info(f"📡 SERVIÇO: Gerando embedding para: {text[:20]}...")
     try:
-        # Tenta usar o modelo mais recente
-        res = await ai_client.aio.models.embed_content(model='text-embedding-004', contents=text)
+        # gemini-embedding-001 é o modelo atual recomendado que substituiu o 004
+        # Forçamos 768 dimensões para manter a compatibilidade com a tabela no DB
+        res = await ai_client.aio.models.embed_content(
+            model='gemini-embedding-001', 
+            contents=text,
+            config={'output_dimensionality': 768}
+        )
         return res.embeddings[0].values
     except Exception as e:
-        logger.warning(f"Erro no text-embedding-004: {e}. Tentando fallback models/embedding-001...")
-        try:
-            # Fallback com prefixo explícito caso o SDK precise
-            res = await ai_client.aio.models.embed_content(model='models/embedding-001', contents=text)
-            return res.embeddings[0].values
-        except Exception as e2:
-            logger.error(f"Falha total de embedding: {e2}")
-            return None
+        logger.error(f"Falha total de embedding com gemini-embedding-001: {e}")
+        return None
 
 def parse_numeric(text: str) -> Optional[float]:
     """Robust parser for numeric inputs like '75,5', '175cm', '80kg'."""

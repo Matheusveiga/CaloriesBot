@@ -351,7 +351,7 @@ async def process_goal(callback: types.CallbackQuery, state: FSMContext):
     tdee = calculate_tdee(data['weight'], data['height'], data['age'], data['gender'], data['activity'], goal)
     supabase.table("profiles").upsert({"user_id": str(callback.from_user.id), **data, "goal": goal, "tdee": tdee}).execute()
     await state.clear()
-    await callback.message.edit_text(f"✨ Perfil pronto! Meta: {tdee} kcal")
+    await callback.message.edit_text(f"✨ **Perfil pronto!** Meta: **{tdee} kcal**", parse_mode="Markdown")
 
 @dp.message(Command("cancelar"))
 async def cmd_cancel(message: types.Message, state: FSMContext):
@@ -375,7 +375,15 @@ async def process_barcode_portion(message: types.Message, state: FSMContext):
 
 async def process_food_entry(message: types.Message, items: list, raw_data: str):
     if not items: return
+    
+    # 1. Processar porções e totalizadores do registro atual
+    total_new_kcal = 0
+    total_new_p = 0
+    total_new_c = 0
+    total_new_f = 0
+    
     for i in items:
+        # Extrair gramagem
         grams = extract_amount(i['peso'])
         if grams and grams > 0:
             factor = grams / 100
@@ -383,13 +391,66 @@ async def process_food_entry(message: types.Message, items: list, raw_data: str)
             i['proteina'] = round(i.get('proteina', 0) * factor)
             i['carboidratos'] = round(i.get('carboidratos', 0) * factor)
             i['gorduras'] = round(i.get('gorduras', 0) * factor)
+        
+        total_new_kcal += i['calorias']
+        total_new_p += i['proteina']
+        total_new_c += i['carboidratos']
+        total_new_f += i['gorduras']
+
+    # 2. Salvar no banco
     if not log_calories(message.from_user.id, message.from_user.full_name, items):
         await message.answer("❌ Erro ao salvar.")
         return
+
+    # 3. Preparar dados para o Resumo
     stats = get_daily_stats(message.from_user.id)
     profile = get_user_profile(message.from_user.id)
     limit = profile['tdee'] if profile else 2000
-    await message.answer(f"✅ Registrado! Hoje: {stats['kcal']} / {limit} kcal")
+    remaining = limit - stats['kcal']
+    day_str = get_br_now().strftime("%d/%m")
+    
+    # Progress Bar
+    progress_val = min(10, round((stats['kcal']/limit)*10)) if limit > 0 else 0
+    progress_bar = "🔵" * progress_val + "⚪" * (10 - progress_val)
+
+    # 4. Construir Template Premium
+    icons = {"Almoço": "🍱", "Jantar": "🍽️", "Café": "☕", "Lanche": "🥪", "Outro": "🍏"}
+    meal_type = items[0].get("refeicao", "Outro")
+    meal_icon = icons.get(meal_type, "🍏")
+    
+    # Decidir ícones de precisão (Internet vs Verificado)
+    precision_icon = "⚠️" if not items[0].get("is_precise") else "✅"
+    source_icon = "🌐" if "Search" in str(raw_data) or "DDG" in str(raw_data) or "Serper" in str(raw_data) else "🧬"
+
+    msg = (
+        f"✅ **Registro Confirmado!**\n"
+        f"――――――――――――――――――――――\n"
+        f"{meal_icon} **{meal_type.upper()}**\n"
+        f"🍎 {items[0]['alimento']}\n"
+        f"⚖️ {items[0]['peso']} | 🔥 {items[0]['kcal']} kcal {precision_icon} {source_icon}\n"
+        f"   └ 💪 P: {items[0]['proteina']}g | 🍞 C: {items[0]['carboidratos']}g | 🥑 G: {items[0]['gorduras']}g\n\n"
+        f"📊 **RESUMO DO DIA ({day_str})**\n"
+        f"――――――――――――――――――――――\n"
+        f"🔥 Consumo: {stats['kcal']} / {limit} kcal\n"
+        f"⚖️ Restante: {max(0, remaining)} kcal\n\n"
+        f"💪 P: {stats['protein']}g | 🍞 C: {stats['carbs']}g | 🥑 G: {stats['fat']}g\n\n"
+        f"|{progress_bar}|"
+    )
+
+    # 5. Teclado de Ações
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🗳️ Votar Correto", callback_data="confirm_precise"),
+            InlineKeyboardButton(text="🎨 Corrigir", callback_data="manual_correct")
+        ],
+        [
+            InlineKeyboardButton(text="+ 10%", callback_data="adj_1.1"),
+            InlineKeyboardButton(text="- 10%", callback_data="adj_0.9")
+        ],
+        [InlineKeyboardButton(text="🔄 Desfazer", callback_data="adj_undo")]
+    ])
+
+    await message.answer(msg, parse_mode="Markdown", reply_markup=kb)
 
 @dp.message(F.photo)
 async def handle_photo(message: types.Message, state: FSMContext):

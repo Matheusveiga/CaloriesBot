@@ -550,13 +550,18 @@ async def search_fatsecret(food_name: str):
                     if not servings: continue
                     s = servings[0]
                     
+                    # Get the most accurate serving weight
+                    serving_qty = s.get("metric_serving_amount")
+                    serving_unit = s.get("metric_serving_unit", "g")
+                    weight_str = f"{float(serving_qty):.1f}{serving_unit}" if serving_qty else "100g"
+                    
                     result = {
                         "alimento": queries.get('pt') or food_name, # Salva com o nome original em PT!
                         "calorias": float(s.get("calories", 0)),
                         "proteina": float(s.get("protein", 0)),
                         "carboidratos": float(s.get("carbohydrate", 0)),
                         "gorduras": float(s.get("fat", 0)),
-                        "peso": "100g",
+                        "peso": weight_str,
                         "is_precise": True
                     }
                     # Save to catalog logic
@@ -637,9 +642,10 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
 
         REGRAS:
         1. Identifique a quantidade no texto (ex: "2 fatias").
-        2. Use os DADOS DE BUSCA para saber quanto vale 1 porção/100g.
+        2. Use os DADOS DE BUSCA para saber quanto vale 1 porção e o seu peso em gramas.
         3. FAÇA A CONTA e retorne os macros ajustados para a quantidade do usuário.
-        4. Retorne APENAS um objeto JSON com a chave "itens".
+        4. No campo "peso", escreva a quantidade exata lida MAIS o peso total em gramas calculado (Exemplo: "2 fatias (52g)").
+        5. Retorne APENAS um objeto JSON com a chave "itens".
         
         SCHEMA: {{"itens": [{{"alimento": str, "peso": str, "calorias": int, "proteina": float, "carboidratos": float, "gorduras": float, "refeicao": str, "is_precise": bool}}]}}
         """

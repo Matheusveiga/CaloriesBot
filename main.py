@@ -644,7 +644,7 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
         1. Identifique a quantidade no texto (ex: "2 fatias").
         2. Use os DADOS DE BUSCA para saber quanto vale 1 porção e o seu peso em gramas.
         3. FAÇA A CONTA e retorne os macros ajustados para a quantidade do usuário.
-        4. No campo "peso", escreva a quantidade exata lida MAIS o peso total em gramas calculado (Exemplo: "2 fatias (52g)").
+        4. No campo "peso", se a quantidade informada for a mesma que o peso (ex: "200g"), retorne apenas "200g". Caso contrário, mostre ambos (ex: "2 fatias (52g)").
         5. Retorne APENAS um objeto JSON com a chave "itens".
         
         SCHEMA: {{"itens": [{{"alimento": str, "peso": str, "calorias": int, "proteina": float, "carboidratos": float, "gorduras": float, "refeicao": str, "is_precise": bool}}]}}

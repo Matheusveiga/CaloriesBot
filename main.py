@@ -68,8 +68,8 @@ if GROQ_API_KEY:
     groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 
 # Constants
-AI_MODEL = "gemini-1.5-flash"
-AI_MODEL_FALLBACK = "gemini-2.0-flash-exp" # Example updated fallback
+AI_MODEL = "gemini-2.0-flash"
+AI_MODEL_FALLBACK = "gemini-1.5-flash"
 
 # States
 class ProfileStates(StatesGroup):
@@ -83,11 +83,15 @@ class ProfileStates(StatesGroup):
 class BarcodeState(StatesGroup):
     waiting_for_portion = State()
 
+class CorrectionStates(StatesGroup):
+    kcal = State()
+
 # Global State
 processed_messages = set()
 fs_token = {"access_token": None, "expires_at": 0}
 fs_lock = asyncio.Lock()
 AI_CACHE = {}
+user_history = {}
 jailbreak_users = {}
 
 # --- Security Logic ---
@@ -149,6 +153,16 @@ def get_br_today_start():
     """Returns the start of today in Brazil (00:00:00) in ISO format with offset."""
     return get_br_now().strftime("%Y-%m-%dT00:00:00-03:00")
 
+def parse_numeric(text: str) -> Optional[float]:
+    """Robust parser for numeric inputs like '75,5', '175cm', '80kg'."""
+    if not text: return None
+    t = str(text).lower().replace(',', '.')
+    match = re.search(r"(\d+[\.,]?\d*)", t)
+    if match:
+        try: return float(match.group(1))
+        except: return None
+    return None
+
 # --- DB Logic ---
 
 def log_calories(user_id: str, user_name: str, items: list):
@@ -173,7 +187,7 @@ def log_calories(user_id: str, user_name: str, items: list):
                 entry["embedding"] = item.get("embedding")
             prepared_data.append(entry)
         if prepared_data:
-            supabase.table("logs").insert(prepared_data).execute()
+            res = supabase.table("logs").insert(prepared_data).execute()
         return True
     except Exception as e:
         logger.error(f"Erro ao salvar no Supabase: {e}")
@@ -239,18 +253,33 @@ def get_user_profile(user_id: str):
         logger.error(f"Erro ao buscar perfil: {e}")
         return None
 
-def get_daily_total(user_id: str):
+def get_daily_stats(user_id: str):
+    """Calculates total calories and macros for the current day."""
     try:
         today_br_start = get_br_today_start()
         response = supabase.table("logs") \
-            .select("kcal") \
+            .select("kcal, protein, carbs, fat") \
             .eq("user_id", str(user_id)) \
             .gte("created_at", today_br_start) \
             .execute()
-        return sum(item.get('kcal', 0) for item in response.data)
+            
+        total_kcal = sum(item.get('kcal', 0) for item in response.data)
+        total_prot = sum(item.get('protein', 0) for item in response.data)
+        total_carb = sum(item.get('carboidratos', 0) for item in response.data)
+        total_fat = sum(item.get('fat', 0) for item in response.data)
+        
+        return {
+            "kcal": total_kcal,
+            "protein": total_prot,
+            "carbs": total_carb,
+            "fat": total_fat
+        }
     except Exception as e:
-        logger.error(f"Erro ao calcular total diário: {e}")
-        return 0
+        logger.error(f"Erro ao calcular estatísticas diárias: {e}")
+        return {"kcal": 0, "protein": 0, "carbs": 0, "fat": 0}
+
+def get_daily_total(user_id: str):
+    return get_daily_stats(user_id)["kcal"]
 
 def get_report_data(user_id: str, days: int):
     """Aggregates data for periodic reports."""
@@ -288,14 +317,79 @@ def delete_last_log(user_id: str):
         logger.error(f"Erro ao deletar último log: {e}")
         return False
 
+def delete_today_logs(user_id: str):
+    """Deletes all logs from the current day."""
+    try:
+        today_br_start = get_br_today_start()
+        supabase.table("logs").delete() \
+            .eq("user_id", str(user_id)) \
+            .gte("created_at", today_br_start) \
+            .execute()
+        return True
+    except Exception as e:
+        logger.error(f"Erro ao deletar logs de hoje: {e}")
+        return False
+
+def delete_entire_profile(user_id: str):
+    """Deletes profile and all logs for a user."""
+    try:
+        supabase.table("logs").delete().eq("user_id", str(user_id)).execute()
+        supabase.table("profiles").delete().eq("user_id", str(user_id)).execute()
+        return True
+    except Exception as e:
+        logger.error(f"Erro ao deletar perfil completo: {e}")
+        return False
+
+def search_food_history(user_id: str, food_query: str):
+    """Searches for a historical log entry (Personal -> Universal Fallback)."""
+    try:
+        # Pessoal Exato
+        res = supabase.table("logs") \
+            .select("food, weight, kcal, protein, carbs, fat, meal_type, is_precise") \
+            .eq("user_id", str(user_id)) \
+            .ilike("food", f"{food_query}") \
+            .order("created_at", desc=True) \
+            .limit(1) \
+            .execute()
+        
+        # Pessoal Aproximado
+        if not res.data:
+            res = supabase.table("logs") \
+                .select("food, weight, kcal, protein, carbs, fat, meal_type, is_precise") \
+                .eq("user_id", str(user_id)) \
+                .ilike("food", f"%{food_query}%") \
+                .order("created_at", desc=True) \
+                .limit(1) \
+                .execute()
+            if res.data: res.data[0]["is_approximate"] = True
+
+        if res and res.data:
+            item = res.data[0]
+            return [{
+                "alimento": item.get("food", food_query),
+                "peso": item.get("weight", "100g"),
+                "calorias": item.get("kcal", 0),
+                "proteina": item.get("protein", 0),
+                "carboidratos": item.get("carbs", 0),
+                "gorduras": item.get("fat", 0),
+                "refeicao": item.get("meal_type", "Outro"),
+                "is_precise": item.get("is_precise", False),
+                "is_approximate": item.get("is_approximate", False)
+            }]
+        return None
+    except Exception as e:
+        logger.error(f"Erro ao buscar no histórico: {e}")
+        return None
+
 # --- AI & Search Logic ---
 
 async def get_embedding(text: str):
-    """Generates a embedding using gemini text-embedding-004."""
+    """Generates a 768d embedding using gemini-embedding-001."""
     try:
         res = await ai_client.aio.models.embed_content(
-            model="text-embedding-004",
-            contents=[text]
+            model='gemini-embedding-001',
+            contents=text,
+            config={'output_dimensionality': 768}
         )
         return res.embeddings[0].values
     except Exception as e:
@@ -406,14 +500,21 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
 
     # 2. FatSecret (Text only fallback before Vision)
     if not image_bytes and message_text:
-        fs_res = await search_fatsecret(message_text)
+        # Use surgical query
+        query = await generate_surgical_query(message_text)
+        fs_res = await search_fatsecret(query)
         if fs_res:
+            # search_fatsecret now returns a list of dicts or None, and saves to catalog
+            # Wait, let's verify what search_fatsecret returns in our monolith
+            # Looking at my previous turn's multi_replace_file_content... 
+            # It returns [result] which is a list of dicts.
             return fs_res, None, None, "FatSecret Match"
 
     # 3. Gemini extraction
     prompt = """
-    Você é um nutricionista. Analise e retorne JSON.
+    Você é um nutricionista especialista. Analise e retorne JSON.
     SCHEMA: {"foods": [{"alimento": str, "peso": str, "calorias": int, "proteina": float, "carboidratos": float, "gorduras": float, "refeicao": str}], "barcode": str}
+    REGRAS: Normalize os macros para 100g/ml se possível.
     """
     contents = [prompt, message_text] if message_text else [prompt]
     if image_bytes:
@@ -425,10 +526,68 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
             config=ai_types.GenerateContentConfig(response_mime_type="application/json")
         )
         data = json.loads(res.text)
-        return data.get("foods", []), data.get("barcode"), None, res.text
+        foods = data.get("foods", [])
+        # Save results from Gemini to catalog too if they look precise
+        if not image_bytes and foods and len(foods) == 1:
+            item = foods[0]
+            emb = await get_embedding(item["alimento"])
+            item["embedding"] = emb
+            item["is_precise"] = False # Gemini extractions are estimates
+            save_to_universal_catalog(item)
+            
+        return foods, data.get("barcode"), None, res.text
     except Exception as e:
         logger.error(f"Gemini Error: {e}")
         return [], None, str(e), None
+
+def extract_amount(text: str) -> Optional[float]:
+    """Extracts weight (g) or volume (ml) from text. Handles fractions and household measures."""
+    if not text: return None
+    t = str(text).lower().replace(",", ".")
+    
+    household = [
+        (r"(colher\s*de\s*sopa|c\.\s*sopa|colher\s*s)", 15),
+        (r"(colher\s*de\s*sobremesa)", 10),
+        (r"(colher\s*de\s*ch[aá]|colher\s*c)", 5),
+        (r"(colher\s*de\s*caf[eé])", 2),
+        (r"(x[ií]cara)", 200),
+        (r"(copo|c\.)", 200),
+        (r"(fatia|f\.)", 30)
+    ]
+
+    fractions = {
+        "meio": 0.5, "metade": 0.5, "1/2": 0.5,
+        "um quarto": 0.25, "1/4": 0.25,
+        "um terço": 0.33, "1/3": 0.33,
+        "três quartos": 0.75, "3/4": 0.75
+    }
+    for word, mult in fractions.items():
+        if word in t:
+            for pattern, factor in household:
+                if re.search(rf"{word}\s*{pattern}", t):
+                    return mult * factor
+    
+    for pattern, factor in household:
+        match = re.search(rf"(\d+[\.,]?\d*)?\s*{pattern}", t)
+        if match:
+            qty = float(match.group(1).replace(",", ".")) if match.group(1) else 1.0
+            return qty * factor
+
+    kg_match = re.search(r"(\d+[\.,]?\d*)\s*(kg|kilo|l$|litro|l\s)", t)
+    if kg_match:
+        try: return float(kg_match.group(1)) * 1000
+        except: pass
+
+    g_match = re.search(r"(\d+[\.,]?\d*)\s*(g|gr|ml)", t)
+    if g_match:
+        try: return float(g_match.group(1))
+        except: pass
+    
+    num_match = re.search(r"^(\d+[\.,]?\d*)$", t)
+    if num_match:
+        try: return float(num_match.group(1))
+        except: pass
+    return None
 
 def calculate_tdee(weight, height, age, gender, activity, goal):
     # Mifflin-St Jeor
@@ -464,169 +623,7 @@ async def get_barcode_data(barcode: str):
             logger.error(f"Erro ao buscar OpenFoodFacts: {e}")
     return None
 
-async def extract_calories_list(user_id: int, message_text: str = "", image_bytes: Optional[bytes] = None):
-    """
-    Calls Gemini to extract food items from text or image. 
-    Returns (items_list, error_type, raw_response)
-    """
-    # Get history
-    history = user_history.get(user_id, [])
-    history_ctx = "\n".join(history[-5:]) if history else "Sem histórico."
-    
-    # Horário local Brasil (UTC-3) para inferência de refeição
-    now_br = get_br_now()
-    hora_local = now_br.strftime("%H:%M")
-
-    # Check Cache for text-only inputs
-    cache_key = f"{message_text}_{image_bytes is not None}"
-    if not image_bytes:
-        # 1. Check In-memory cache
-        if cache_key in AI_CACHE:
-            logger.info(f"Usando Cache em memória para: {message_text}")
-            return AI_CACHE[cache_key], None, None, "MEMORY_CACHE"
-        
-        # 2. Check DB History (if it's a simple food name)
-        if len(message_text.split()) <= 3: # Apenas para buscas simples
-            db_match = search_food_history(user_id, message_text.strip())
-            # Se for aproximado, não retornamos aqui, deixamos cair na IA ou na pergunta
-            if db_match and db_match[0].get("is_approximate"):
-                logger.info(f"Achei item próximo no DB: {db_match[0]['alimento']}. Deixando fluir.")
-            # SÓ pula a IA se o item do banco for PRECISO (já validado) e EXATO
-            elif db_match and db_match[0].get("is_precise"):
-                logger.info(f"Usando Cache DB VERIFICADO para: {message_text}")
-                AI_CACHE[cache_key] = db_match
-                return db_match, None, None, "DB_VERIFIED_CACHE"
-            elif db_match:
-                logger.info(f"Item no DB é impreciso. Chamando IA para verificação: {message_text}")
-                # Não retornamos aqui, deixamos cair na IA para 'verificar'
-
-    prompt = f"""
-    Você é um nutricionista especialista. 
-    OBJETIVO: Identificar APENAS OS NOVOS alimentos da "ENTRADA ATUAL", extraindo calorias, macronutrientes e o tipo de refeição.
-    
-    REGRAS DE PESQUISA:
-    1. PRIORIZE encontrar a TABELA NUTRICIONAL oficial (TACO/USDA ou fabricante).
-    2. Identifique: Nome, peso, calorias (kcal), proteínas (g), carbos (g) e gorduras (g).
-    3. Classifique a REFEIÇÃO ({hora_local}: 05-10:30 Café, 11-14:30 Almoço, 18-23 Jantar, outros: Lanche).
-    4. **CÓDIGO DE BARRAS:** Se a imagem contiver um código de barras visível (EAN-13, etc), extraia os números no campo `barcode` (sem espaços).
-    5. Retorne JSON: 
-       {{ "items": [ {{"alimento": "str", "peso": "str", "calorias": int, "proteina": int, "carboidratos": int, "gorduras": int, "refeicao": "str", "is_precise": bool}} ], "barcode": "string_or_null" }}
-    6. Campo `is_precise`: `true` se a marca/tipo for identificado; `false` se for estimativa genérica.
-    
-    CONTEXTO: {history_ctx}
-    ENTRADA ATUAL: "{message_text}"
-    """
-    
-    raw_text = ""
-    # --- IA LOGIC: SPECIALIZED ROUTING ---
-    # IMAGE PATH: Gemini 1.5 Flash (Superior Vision) -> Gemini 3.1 Lite (Fallback)
-    # TEXT PATH: Groq 70B (Superior Speed) -> Gemini 3.1 Lite (Fallback)
-    
-    use_vision = image_bytes is not None
-    ai_success = False
-
-    if use_vision:
-        logger.info("ROTA IMAGEM: Tentando IA Especialista (Gemini 1.5 Flash)...")
-        config = ai_types.GenerateContentConfig(
-            tools=[ai_types.Tool(google_search=ai_types.GoogleSearch())]
-        )
-        contents = [prompt]
-        contents.append(ai_types.Part.from_bytes(data=image_bytes, mime_type='image/jpeg'))
-        
-        try:
-            response = await call_gemini_with_retry(contents, config=config) # Versão 1.5 Flash
-            raw_text = response.text
-            ai_success = True
-            logger.info("IA Especialista (Gemini 1.5 Flash) bem sucedida!")
-        except Exception as e:
-            logger.warning(f"Gemini 1.5 Flash falhou: {e}. Indo para Fallback Lite...")
-    else:
-        logger.info("ROTA TEXTO: Tentando IA de Alta Velocidade (Groq 70B)...")
-        if groq_client:
-            try:
-                raw_text = await call_groq_fallback(message_text, None, prompt)
-                if raw_text:
-                    ai_success = True
-                    logger.info("IA de Alta Velocidade (Groq) bem sucedida!")
-            except Exception as e:
-                logger.warning(f"Groq falhou: {e}")
-
-    # UNIVERSAL FALLBACK: Se o caminho primário falhou, usa o 3.1 Lite
-    if not ai_success:
-        logger.warning("Caminho primário falhou. Tentando Fallback Universal: Gemini 3.1 Flash Lite...")
-        config = ai_types.GenerateContentConfig() # Lite não precisa de search para fallback rápido
-        contents = [prompt]
-        if use_vision:
-            contents.append(ai_types.Part.from_bytes(data=image_bytes, mime_type='image/jpeg'))
-
-        try:
-            # Usamos explicitamente o modelo Lite para fallback
-            response = await ai_client.aio.models.generate_content(
-                model=AI_MODEL_FALLBACK,
-                contents=contents,
-                config=config
-            )
-            raw_text = response.text
-            logger.info("Fallback Gemini 3.1 Flash Lite bem sucedido!")
-        except Exception as e2:
-            logger.error(f"Apocalipse de IA: Ambas falharam: {e2}")
-            return None, None, "ai_error", str(e2)
-
-    try:
-        # Robust JSON extraction
-        cleaned_text = raw_text.strip()
-        if "```json" in cleaned_text:
-            cleaned_text = cleaned_text.split("```json")[1].split("```")[0]
-        elif "```" in cleaned_text:
-            cleaned_text = cleaned_text.split("```")[1].split("```")[0]
-            
-        result_json = json.loads(cleaned_text.strip())
-        items = result_json.get("items", [])
-        barcode = result_json.get("barcode")
-        
-        # Sanitize and force types
-        sanitized_items = []
-        for item in items:
-            if isinstance(item, dict) and item.get("alimento"):
-                item["calorias"] = int(float(item.get("calorias", 0)))
-                sanitized_items.append(item)
-
-        # Guarda de plausibilidade simples para evitar outliers absurdos
-        final_items = []
-        for item in sanitized_items:
-            grams = extract_weight_in_grams(item.get("peso", ""))
-            kcal = int(float(item.get("calorias", 0)))
-
-            if grams and grams > 0:
-                kcal_per_100g = (kcal / grams) * 100
-                # Faixa ampla para cobrir diferentes alimentos, mas evita aberrações
-                if kcal_per_100g < 15 or kcal_per_100g > 900:
-                    logger.warning(
-                        "Valor fora da faixa plausível (%s kcal/100g) para item %s. Mantendo extração original.",
-                        round(kcal_per_100g, 2),
-                        item.get("alimento", "desconhecido")
-                    )
-
-            final_items.append(item)
-
-        # Update memory with what was actually extracted
-        if final_items:
-            if user_id not in user_history: user_history[user_id] = []
-            extracted_summary = ", ".join([f"{i['alimento']} ({i.get('peso', '')})" for i in final_items])
-            user_history[user_id].append(f"LOGADO ANTERIORMENTE: {extracted_summary}")
-            if len(user_history[user_id]) > 10: user_history[user_id] = user_history[user_id][-10:]
-
-        # Store in Cache (Persistent & Memory) if successful and not an image
-        if not image_bytes and final_items:
-            AI_CACHE[cache_key] = final_items
-
-        return final_items, barcode, None, raw_text
-    except JSONDecodeError as e:
-        logger.error(f"Erro ao decodificar JSON da IA: {e}")
-        return None, None, "json_error", raw_text
-    except Exception as e:
-        logger.error(f"Gemini error: {e}")
-        return None, None, "ai_error", str(e)
+# Logic consolidated above
 
 # --- Mifflin-St Jeor ---
 
@@ -813,6 +810,44 @@ async def process_adjustment(callback: types.CallbackQuery):
         logger.error(f"Erro ao ajustar calorias: {e}")
         await callback.answer("❌ Erro no ajuste.")
 
+@dp.callback_query(F.data == "manual_correct")
+async def process_manual_correction_start(callback: types.CallbackQuery, state: FSMContext):
+    """Starts the manual correction flow."""
+    await callback.message.answer("Qual o valor real de **calorias (kcal) por 100g**?", parse_mode="Markdown")
+    await state.set_state(CorrectionStates.kcal)
+    await callback.answer()
+
+@dp.message(CorrectionStates.kcal)
+async def process_manual_kcal(message: types.Message, state: FSMContext):
+    """Processes the manual calorie value provided by the user."""
+    kcal_100g = parse_numeric(message.text)
+    if kcal_100g is None:
+        await message.answer("❌ Por favor, envie um número válido.")
+        return
+        
+    user_id = message.from_user.id
+    # Get the latest entry to correct
+    res = supabase.table("logs") \
+        .select("*") \
+        .eq("user_id", str(user_id)) \
+        .order("created_at", desc=True) \
+        .limit(1) \
+        .execute()
+        
+    if res.data:
+        entry = res.data[0]
+        weight = extract_amount(entry.get("weight", "100g")) or 100
+        new_kcal = round((kcal_100g / 100) * weight)
+        
+        supabase.table("logs").update({
+            "kcal": new_kcal,
+            "is_precise": True
+        }).eq("id", entry['id']).execute()
+        
+        await message.answer(f"✅ Corrigido para **{new_kcal} kcal** ({kcal_100g} kcal/100g)!")
+    
+    await state.clear()
+
 @dp.message(Command("cancelar"))
 async def cmd_cancel(message: types.Message, state: FSMContext):
     await state.clear()
@@ -924,7 +959,7 @@ async def process_barcode_portion(message: types.Message, state: FSMContext):
         return
 
     # Extract weight/portion
-    grams = extract_weight_in_grams(message.text)
+    grams = extract_amount(message.text)
     
     # Simple heuristic if no 'g' found
     if not grams:
@@ -1067,6 +1102,60 @@ async def process_food_entry(message: types.Message, items: list, raw_data: str)
         items_text += f"   └ P: {i.get('proteina', 0)}g | C: {i.get('carboidratos', 0)}g | G: {i.get('gorduras', 0)}g\n"
         
     remaining = daily_limit - daily_total
+    progress_val = min(10, round((daily_total/daily_limit)*10)) if daily_limit > 0 else 0
+    progress_bar = "🔵" * progress_val + "⚪" * (10 - progress_val)
+    
+    now_br = get_br_now()
+    data_formatada = now_br.strftime("%d/%m")
+
+    # Feedback Buttons
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ 10%", callback_data="adj_1.1"),
+         InlineKeyboardButton(text="➖ 10%", callback_data="adj_0.9")],
+        [InlineKeyboardButton(text="🔄 Desfazer", callback_data="adj_undo")]
+    ])
+
+    response_text = (
+        f"{items_text}\n"
+        f"📊 **CONTAGEM DE HOJE ({data_formatada})**\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"🔥 Soma: **{daily_total}** / {daily_limit} kcal\n"
+        f"⚖️ Restante: **{max(0, remaining)} kcal**\n\n"
+        f"{progress_bar}"
+    )
+    await message.answer(response_text, parse_mode="Markdown", reply_markup=kb)
+
+# --- Food and Vision Handling ---
+
+async def process_food_entry(message: types.Message, items: list, raw_data: str):
+    """Common logic for saving and responding to food entries."""
+    if not items:
+        return
+
+    # Log to DB
+    if not log_calories(message.from_user.id, message.from_user.full_name, items):
+        await message.answer("❌ Erro ao salvar dados no Supabase.")
+        return
+    
+    stats = get_daily_stats(message.from_user.id)
+    profile = get_user_profile(message.from_user.id)
+    daily_limit = profile['tdee'] if profile else 2000
+    daily_total = stats["kcal"]
+    remaining = daily_limit - daily_total
+    
+    items_text = ""
+    for idx, i in enumerate(items):
+        emoji = "🍎" if idx % 2 == 0 else "🥩"
+        meal = f"[{i.get('refeicao', 'Outro')}] "
+        # Se for preciso (Verificado), não mostra tag. Se for impreciso, mostra (estimado).
+        precisao = "" if i.get("is_precise", False) else " ⚠️ *(estimado)*"
+        
+        # Tag especial para Catálogo Universal
+        universal_tag = " 🌐 *(universal)*" if i.get("is_universal") else ""
+        
+        items_text += f"{emoji} {meal}**{i['alimento']}** ({i['peso']}) → {i['calorias']} kcal{precisao}{universal_tag}\n"
+        items_text += f"   └ P: {i.get('proteina', 0)}g | C: {i.get('carboidratos', 0)}g | G: {i.get('gorduras', 0)}g\n"
+        
     progress_val = min(10, round((daily_total/daily_limit)*10)) if daily_limit > 0 else 0
     progress_bar = "🔵" * progress_val + "⚪" * (10 - progress_val)
     

@@ -444,13 +444,18 @@ async def get_fatsecret_token():
             if client is not http_client: await client.aclose()
 
 async def generate_surgical_query(food_name: str):
-    """Generates clean food names for both PT and EN search."""
-    if not groq_client: return {"pt": food_name, "en": food_name}
+    """Generates clean food names for both PT and EN search with variations."""
+    if not groq_client: return {"pt": food_name, "en_spec": food_name, "en_gen": food_name}
     
     prompt = f"""
-    Extraia o nome puro do alimento. Retorne JSON:
-    {{"pt": "nome em português", "en": "english name"}}
-    Exemplo: "2 fatias de pão visconti" -> {{"pt": "pão visconti", "en": "sliced white bread visconti"}}
+    Extraia o nome do alimento. Retorne JSON com 3 variações:
+    1. "pt": Nome limpo em português.
+    2. "en_spec": Nome específico em inglês (com marca/tipo).
+    3. "en_gen": Nome genérico em inglês (apenas o tipo de alimento).
+    
+    Exemplo: "2 fatias de pão de forma visconti" -> 
+    {{"pt": "pão de forma visconti", "en_spec": "sliced bread visconti", "en_gen": "sliced white bread"}}
+    
     Entrada: "{food_name}"
     """
     
@@ -466,92 +471,106 @@ async def generate_surgical_query(food_name: str):
         return json.loads(data)
     except Exception as e:
         logger.error(f"Groq surgical query error: {e}")
-        return {"pt": food_name, "en": food_name}
+        return {"pt": food_name, "en_spec": food_name, "en_gen": food_name}
 
 async def search_fatsecret(food_name: str):
     token = await get_fatsecret_token()
     if not token: return None
     
     url = "https://platform.fatsecret.com/rest/server.api"
-    # Dual query strategy
     queries = await generate_surgical_query(food_name)
     
-    # Try with EN first for better matching in Global DB
-    search_term = queries.get("en") or queries.get("pt")
-    
-    params = {
-        "method": "foods.search", 
-        "search_expression": search_term, 
-        "format": "json", 
-        "region": "BR", # Still kept as hint
-        "language": "pt",
-        "max_results": 5 # Get multiple results to find the needle in the haystack
-    }
-    headers = {"Authorization": f"Bearer {token}"}
-    
-    client = get_fs_client()
-    found_items = []
-    
-    try:
-        res = await client.get(url, params=params, headers=headers)
-        if res.status_code == 200:
-            data = res.json()
-            logger.info(f"FatSecret Raw Search Results (Total): {json.dumps(data, ensure_ascii=False)}")
+    # 1. Estratégia: O Genérico em Inglês é a nossa maior chance de sucesso absoluto no banco global.
+    for search_key in ["en_gen", "en_spec", "pt"]:
+        search_term = queries.get(search_key)
+        if not search_term: continue
+        
+        # 2. REMOVIDOS o region="BR" e language="pt". Banco global puro.
+        params = {
+            "method": "foods.search", 
+            "search_expression": search_term, 
+            "format": "json", 
+            "max_results": 5
+        }
+        headers = {"Authorization": f"Bearer {token}"}
+        
+        client = get_fs_client()
+        try:
+            res = await client.get(url, params=params, headers=headers)
+            if res.status_code != 200: continue
             
+            data = res.json()
             foods_data = data.get("foods", {}).get("food", [])
-            if not foods_data: return None
+            if not foods_data: continue
             if isinstance(foods_data, dict): foods_data = [foods_data]
             
-            # Step 2: Use Groq to select the most relevant match from the list
+            logger.info(f"FatSecret Searching with '{search_term}' ({search_key}). Results: {len(foods_data)}")
+
             selection_prompt = f"""
-            Qual desses alimentos é o melhor match para: "{queries.get('pt')}"?
-            RESULTADOS: {json.dumps(foods_data, ensure_ascii=False)}
-            Retorne o index (0, 1, 2...) ou -1 se nenhum for relevante.
-            Apenas o número.
+            Qual desses alimentos é o MELHOR match para o pedido original: "{queries.get('pt')}"?
+            
+            REGRAS RÍGIDAS:
+            1. Se nenhum alimento for do MESMO TIPO/CATEGORIA (ex: pão deve ser pão, carne deve ser carne), retorne -1.
+            2. Não aceite ham (presunto) se o pedido for bread (pão).
+            3. Priorize o primeiro que fizer sentido.
+            
+            RESULTADOS: {json.dumps([{"name": f['food_name'], "desc": f['food_description']} for f in foods_data], ensure_ascii=False)}
+            
+            Retorne APENAS o índice (0, 1, 2...) ou -1.
             """
             
+            # 3. Alterado para o modelo 70B. Ele respeita muito melhor a regra do -1.
             sel_res = await groq_client.chat.completions.create(
                 messages=[{"role": "user", "content": selection_prompt}],
-                model="llama-3.1-8b-instant",
+                model="llama-3.3-70b-versatile",
                 temperature=0,
             )
-            try:
-                idx = int(sel_res.choices[0].message.content.strip())
-                if idx < 0 or idx >= len(foods_data): return None
-                best_food = foods_data[idx]
-            except:
-                best_food = foods_data[0] # Fallback to first if LLM fails
             
-            food_id = best_food["food_id"]
-            d_res = await client.get(url, params={"method": "food.get.v2", "food_id": food_id, "format": "json", "region": "BR", "language": "pt"}, headers=headers)
-            if d_res.status_code == 200:
-                d_data = d_res.json()
-                logger.info(f"FatSecret Raw Detail Result: {json.dumps(d_data, ensure_ascii=False)}")
+            try:
+                raw_idx = sel_res.choices[0].message.content.strip()
+                idx = int(re.sub(r'[^0-9-]', '', raw_idx))
+                if idx < 0 or idx >= len(foods_data):
+                    logger.warning(f"Selection rejected for '{search_term}'. Trying next term...")
+                    continue
                 
-                d = d_data.get("food", {})
-                servings = d.get("servings", {}).get("serving", [])
-                if isinstance(servings, dict): servings = [servings]
-                if not servings: return None
-                s = servings[0]
+                best_food = foods_data[idx]
+                logger.info(f"🎯 FatSecret Selected: {best_food['food_name']}")
                 
-                result = {
-                    "alimento": d.get("food_name"),
-                    "calorias": float(s.get("calories", 0)),
-                    "proteina": float(s.get("protein", 0)),
-                    "carboidratos": float(s.get("carbohydrate", 0)),
-                    "gorduras": float(s.get("fat", 0)),
-                    "peso": "100g",
-                    "is_precise": True
-                }
-                # Save to catalog logic
-                emb = await get_embedding(result["alimento"])
-                result["embedding"] = emb
-                save_to_universal_catalog(result)
-                return [result]
-    except Exception as e:
-        logger.error(f"FatSecret Search Error: {e}")
-    finally:
-        if client is not http_client: await client.aclose()
+                # Fetch details - SEM region e language
+                food_id = best_food["food_id"]
+                d_res = await client.get(url, params={"method": "food.get.v2", "food_id": food_id, "format": "json"}, headers=headers)
+                
+                if d_res.status_code == 200:
+                    d_data = d_res.json()
+                    logger.info(f"FatSecret Raw Detail Result: {json.dumps(d_data, ensure_ascii=False)}")
+                    
+                    d = d_data.get("food", {})
+                    servings = d.get("servings", {}).get("serving", [])
+                    if isinstance(servings, dict): servings = [servings]
+                    if not servings: continue
+                    s = servings[0]
+                    
+                    result = {
+                        "alimento": queries.get('pt') or food_name, # Salva com o nome original em PT!
+                        "calorias": float(s.get("calories", 0)),
+                        "proteina": float(s.get("protein", 0)),
+                        "carboidratos": float(s.get("carbohydrate", 0)),
+                        "gorduras": float(s.get("fat", 0)),
+                        "peso": "100g",
+                        "is_precise": True
+                    }
+                    # Save to catalog logic
+                    emb = await get_embedding(result["alimento"])
+                    result["embedding"] = emb
+                    save_to_universal_catalog(result)
+                    return [result]
+            except Exception as e:
+                logger.error(f"Error in FatSecret selection/detail: {e}")
+                continue
+        except Exception as e:
+            logger.error(f"FatSecret Searching Error for '{search_term}': {e}")
+        finally:
+            if client is not http_client: await client.aclose()
     return None
 
 async def extract_calories_list(user_id: int, message_text: str = "", image_bytes: bytes = None):
@@ -1219,7 +1238,8 @@ async def process_food_entry(message: types.Message, items: list, raw_data: str)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ 10%", callback_data="adj_1.1"),
          InlineKeyboardButton(text="➖ 10%", callback_data="adj_0.9")],
-        [InlineKeyboardButton(text="🔄 Desfazer", callback_data="adj_undo")]
+        [InlineKeyboardButton(text="🔧 Corrigir", callback_data="manual_correct"),
+         InlineKeyboardButton(text="🔄 Desfazer", callback_data="adj_undo")]
     ])
 
     response_text = (

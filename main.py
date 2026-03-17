@@ -203,6 +203,7 @@ def log_calories(user_id: str, user_name: str, items: list):
             prepared_data.append(entry)
         if prepared_data:
             res = supabase.table("logs").insert(prepared_data).execute()
+            logger.info(f"Supabase Log Insertion Result: {res.data}")
         return True
     except Exception as e:
         logger.error(f"Erro ao salvar no Supabase: {e}")
@@ -227,7 +228,8 @@ def save_to_universal_catalog(item: dict):
             "confirmations": int(item.get("confirmations", 1)),
             "is_precise": bool(item.get("is_precise", True))
         }
-        supabase.table("universal_catalog").insert(data).execute()
+        res = supabase.table("universal_catalog").insert(data).execute()
+        logger.info(f"Supabase Catalog Insertion Result: {res.data}")
         logger.info(f"✅ Item '{food_name}' salvo no Catálogo Universal.")
         return True
     except Exception as e:
@@ -242,6 +244,7 @@ def search_universal_catalog(query_embedding: list, threshold: float = 0.85):
             "match_threshold": threshold,
             "match_count": 1
         }).execute()
+        logger.info(f"Supabase Vector Search result: {res.data}")
         
         if res.data:
             item = res.data[0]
@@ -406,6 +409,7 @@ async def get_embedding(text: str):
             contents=text,
             config={'output_dimensionality': 768}
         )
+        logger.info(f"Embedding generated for text: '{text[:50]}...'")
         return res.embeddings[0].values
     except Exception as e:
         logger.error(f"Erro embedding: {e}")
@@ -430,6 +434,7 @@ async def get_fatsecret_token():
             res = await client.post(url, data=data, auth=auth)
             if res.status_code == 200:
                 d = res.json()
+                logger.info("FatSecret Token Refreshed Successfully")
                 fs_token["access_token"] = d["access_token"]
                 fs_token["expires_at"] = now + d["expires_in"] - 60
                 return fs_token["access_token"]
@@ -437,77 +442,92 @@ async def get_fatsecret_token():
             logger.error(f"FatSecret Token Error: {e}")
         finally:
             if client is not http_client: await client.aclose()
-    return None
 
-async def generate_surgical_query(food_name: str) -> str:
-    """Uses Groq to extract only the food name, removing quantities for FatSecret search."""
-    if not groq_client: return food_name
+async def generate_surgical_query(food_name: str):
+    """Generates clean food names for both PT and EN search."""
+    if not groq_client: return {"pt": food_name, "en": food_name}
     
-    prompt = (
-        f"Extraia APENAS o nome do alimento do texto: '{food_name}'. "
-        "Não inclua explicações, quantidades (como fatias, g, ml), ou pontuação. "
-        "Retorne apenas as palavras que identificam o produto. "
-        "Exemplo: '2 fatias de pão visconti' -> 'pão visconti'"
-    )
+    prompt = f"""
+    Extraia o nome puro do alimento. Retorne JSON:
+    {{"pt": "nome em português", "en": "english name"}}
+    Exemplo: "2 fatias de pão visconti" -> {{"pt": "pão visconti", "en": "sliced white bread visconti"}}
+    Entrada: "{food_name}"
+    """
     
     try:
         completion = await groq_client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
-            model="llama-3.1-8b-instant", # Faster for simple cleanup
+            model="llama-3.1-8b-instant",
+            response_format={"type": "json_object"},
             temperature=0,
         )
-        clean_food = completion.choices[0].message.content.strip().replace('"', '')
-        logger.info(f"Groq cleaned query: {clean_food}")
-        return clean_food
+        data = completion.choices[0].message.content
+        logger.info(f"Groq Surgical Query Response: {data}")
+        return json.loads(data)
     except Exception as e:
         logger.error(f"Groq surgical query error: {e}")
-        return food_name
+        return {"pt": food_name, "en": food_name}
 
 async def search_fatsecret(food_name: str):
     token = await get_fatsecret_token()
     if not token: return None
     
     url = "https://platform.fatsecret.com/rest/server.api"
-    # Optimize query with Groq
-    query = await generate_surgical_query(food_name)
+    # Dual query strategy
+    queries = await generate_surgical_query(food_name)
+    
+    # Try with EN first for better matching in Global DB
+    search_term = queries.get("en") or queries.get("pt")
     
     params = {
         "method": "foods.search", 
-        "search_expression": query, 
+        "search_expression": search_term, 
         "format": "json", 
-        "region": "BR", 
+        "region": "BR", # Still kept as hint
         "language": "pt",
-        "max_results": 1
+        "max_results": 5 # Get multiple results to find the needle in the haystack
     }
     headers = {"Authorization": f"Bearer {token}"}
     
     client = get_fs_client()
+    found_items = []
+    
     try:
         res = await client.get(url, params=params, headers=headers)
         if res.status_code == 200:
             data = res.json()
-            logger.info(f"FatSecret Raw Search Result: {json.dumps(data, ensure_ascii=False)}")
+            logger.info(f"FatSecret Raw Search Results (Total): {json.dumps(data, ensure_ascii=False)}")
             
-            if "error" in data:
-                logger.error(f"FatSecret API Error: {data['error'].get('message')}")
-                return None
-                
             foods_data = data.get("foods", {}).get("food", [])
             if not foods_data: return None
-            
-            # Handle both list and dict response
             if isinstance(foods_data, dict): foods_data = [foods_data]
             
-            food_id = foods_data[0]["food_id"]
-            # CRITICAL: Always include region AND language in food.get.v2
+            # Step 2: Use Groq to select the most relevant match from the list
+            selection_prompt = f"""
+            Qual desses alimentos é o melhor match para: "{queries.get('pt')}"?
+            RESULTADOS: {json.dumps(foods_data, ensure_ascii=False)}
+            Retorne o index (0, 1, 2...) ou -1 se nenhum for relevante.
+            Apenas o número.
+            """
+            
+            sel_res = await groq_client.chat.completions.create(
+                messages=[{"role": "user", "content": selection_prompt}],
+                model="llama-3.1-8b-instant",
+                temperature=0,
+            )
+            try:
+                idx = int(sel_res.choices[0].message.content.strip())
+                if idx < 0 or idx >= len(foods_data): return None
+                best_food = foods_data[idx]
+            except:
+                best_food = foods_data[0] # Fallback to first if LLM fails
+            
+            food_id = best_food["food_id"]
             d_res = await client.get(url, params={"method": "food.get.v2", "food_id": food_id, "format": "json", "region": "BR", "language": "pt"}, headers=headers)
             if d_res.status_code == 200:
                 d_data = d_res.json()
                 logger.info(f"FatSecret Raw Detail Result: {json.dumps(d_data, ensure_ascii=False)}")
-                if "error" in d_data:
-                    logger.error(f"FatSecret Detail Error: {d_data['error'].get('message')}")
-                    return None
-                    
+                
                 d = d_data.get("food", {})
                 servings = d.get("servings", {}).get("serving", [])
                 if isinstance(servings, dict): servings = [servings]
@@ -532,6 +552,8 @@ async def search_fatsecret(food_name: str):
         logger.error(f"FatSecret Search Error: {e}")
     finally:
         if client is not http_client: await client.aclose()
+    return None
+
 async def extract_calories_list(user_id: int, message_text: str = "", image_bytes: bytes = None):
     # Flow: 1. Search (Catalog + FatSecret) -> 2. Contextual Extraction (Groq/Gemini scales everything)
     
@@ -548,10 +570,9 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
 
     # 2. Search FatSecret (Text only fallback)
     if not image_bytes and message_text:
-        query = await generate_surgical_query(message_text)
-        fs_res = await search_fatsecret(query)
+        fs_res = await search_fatsecret(message_text)
         if fs_res:
-            logger.info(f"🔍 FatSecret Context Hit: {query}")
+            logger.info(f"🔍 FatSecret Context Hit for: {message_text}")
             search_context.extend(fs_res)
 
     # 3. Model extraction with Context
@@ -576,8 +597,10 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
                 model=AI_MODEL, contents=contents,
                 config=ai_types.GenerateContentConfig(response_mime_type="application/json")
             )
-            data = json.loads(res.text)
-            return data.get("foods", []), data.get("barcode"), None, res.text
+            raw_text = res.text
+            logger.info(f"Gemini Vision Raw Response: {raw_text}")
+            data = json.loads(raw_text)
+            return data.get("foods", []), data.get("barcode"), None, raw_text
         except Exception as e:
             logger.error(f"Gemini Vision Error: {e}")
             return [], None, str(e), None
@@ -609,10 +632,11 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
                 response_format={"type": "json_object"},
                 temperature=0,
             )
-            data = completion.choices[0].message.content
-            parsed = json.loads(data)
+            raw_data = completion.choices[0].message.content
+            logger.info(f"Groq Unified Extraction Response: {raw_data}")
+            parsed = json.loads(raw_data)
             foods = parsed.get("itens") or parsed.get("foods") or []
-            return foods, None, None, data
+            return foods, None, None, raw_data
         except Exception as e:
             logger.error(f"Groq Unified Extraction Error: {e}")
             return [], None, str(e), None

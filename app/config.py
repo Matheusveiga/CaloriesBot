@@ -54,7 +54,9 @@ dp = Dispatcher(storage=MemoryStorage())
 fastapi_app = FastAPI()
 ai_client = genai.Client(api_key=GEMINI_KEY)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-logger.info(f"💾 Supabase: Cliente iniciado (URL: {SUPABASE_URL[:15]}..., Key: {SUPABASE_KEY[:10]}...)")
+# Verifica se a chave tem o tamanho esperado de uma anon key do Supabase (~120+ chars)
+key_type = "VÁLIDA (Parece Anon Key)" if len(SUPABASE_KEY) > 100 else "INVÁLIDA (MUITO CURTA)"
+logger.info(f"💾 Supabase: URL={SUPABASE_URL[:15]}... | Key={SUPABASE_KEY[:10]}... | Status={key_type} | Len={len(SUPABASE_KEY)}")
 http_client = httpx.AsyncClient(timeout=httpx.Timeout(10.0))
 
 # FatSecret Proxy Config
@@ -71,7 +73,7 @@ def get_fs_client():
     
     # Note: We create a new client per request to ensure the proxy is used
     # In a very high traffic app, we'd cache these, but per-request is safer for rotation.
-    return httpx.AsyncClient(proxies=proxy_url, timeout=httpx.Timeout(15.0))
+    return httpx.AsyncClient(proxy=proxy_url, timeout=httpx.Timeout(15.0))
 
 groq_client = None
 if GROQ_API_KEY:

@@ -440,31 +440,28 @@ async def get_fatsecret_token():
     return None
 
 async def generate_surgical_query(food_name: str) -> str:
-    """Uses Groq to transform name into a surgical search query."""
-    if not GROQ_API_KEY: return food_name
-    prompt = f"Transforme '{food_name}' em uma query cirúrgica para encontrar a tabela nutricional oficial. Retorne APENAS a query. Exemplo: (site:fatsecret.com.br OR site:tabelanutricional.com.br) 'tabela nutricional' {food_name}"
+    """Uses Groq to extract only the food name, removing quantities for FatSecret search."""
+    if not groq_client: return food_name
     
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}", 
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "model": "llama-3.3-70b-versatile", 
-        "messages": [{"role": "user", "content": prompt}]
-    }
+    prompt = (
+        f"Extraia APENAS o nome do alimento do texto: '{food_name}'. "
+        f"Remova quantidades, medidas (como 'fatias', 'gramas') ou pronomes. "
+        f"Exemplo: se o texto for 'comi 2 fatias de pão de forma visconti', "
+        f"retorne APENAS 'pão de forma visconti'."
+    )
+    
     try:
-        # Explicit POST to avoid any accidental GET conversion
-        res = await http_client.post(
-            "https://api.groq.com/openai/v1/chat/completions", 
-            headers=headers, 
-            json=payload,
-            follow_redirects=False
+        completion = await groq_client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model="llama-3.3-70b-versatile",
+            temperature=0,
         )
-        if res.status_code == 200:
-            return res.json()["choices"][0]["message"]["content"].strip().replace('"', '')
+        clean_food = completion.choices[0].message.content.strip().replace('"', '')
+        logger.info(f"Groq cleaned query: {clean_food}")
+        return clean_food
     except Exception as e:
         logger.error(f"Groq surgical query error: {e}")
-    return food_name
+        return food_name
 
 async def search_fatsecret(food_name: str):
     token = await get_fatsecret_token()
@@ -575,40 +572,35 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
             return [], None, str(e), None
     
     elif message_text:
-        # Use Groq for TEXT extraction
-        prompt = f"""
-        Você é um nutricionista especialista. Extraia os alimentos e macros do texto abaixo e retorne APENAS um JSON.
-        TEXTO: "{message_text}"
-        SCHEMA: {{"foods": [{{"alimento": str, "peso": str, "calorias": int, "proteina": float, "carboidratos": float, "gorduras": float, "refeicao": str}}]}}
-        REGRAS: Se não souber o peso, use 100g como base.
+        # 3. Use Groq for TEXT extraction (no image)
+        if not groq_client: return [], None, "Groq client not init", None
+
+        # Base prompt for extraction
+        base_prompt = """
+        Você é um nutricionista especialista. Extraia os alimentos e seus macros (kcal, proteina, carboidratos, gorduras).
+        Retorne APENAS um objeto JSON com a chave "itens" contendo uma lista.
+        Exemplo: {"itens": [{"alimento": "pão", "peso": "50g", "calorias": 130, "proteina": 4.5, "carboidratos": 25, "gorduras": 1.5, "refeicao": "Café da Manhã", "is_precise": true}]}
+        Se o peso não for informado, use 100g como padrão.
         """
-        headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-        payload = {
-            "model": "llama-3.3-70b-versatile", 
-            "messages": [{"role": "user", "content": prompt}],
-            "response_format": {"type": "json_object"}
-        }
+        
+        # We don't have search_results here if search_fatsecret wasn't called or failed, 
+        # but in this flow FatSecret was already tried above.
+        # If we reach here, we are doing a "pure" LLM extraction or using it as a final fallback.
+        prompt = f"{base_prompt}\n\nTexto do usuário: '{message_text}'"
+        
         try:
-            res = await http_client.post(
-                "https://api.groq.com/openai/v1/chat/completions", 
-                headers=headers, 
-                json=payload,
-                follow_redirects=False
+            completion = await groq_client.chat.completions.create(
+                messages=[{"role": "user", "content": prompt}],
+                model="llama-3.3-70b-versatile",
+                response_format={"type": "json_object"},
+                temperature=0,
             )
-            if res.status_code == 200:
-                data = res.json()["choices"][0]["message"]["content"]
-                parsed = json.loads(data)
-                foods = parsed.get("foods", [])
-                
-                # Cache precise results
-                if len(foods) == 1:
-                    item = foods[0]
-                    emb = await get_embedding(item["alimento"])
-                    item["embedding"] = emb
-                    item["is_precise"] = False
-                    save_to_universal_catalog(item)
-                
+            data = completion.choices[0].message.content
+            parsed = json.loads(data)
+            foods = parsed.get("itens") or parsed.get("foods") or []
+            if foods:
                 return foods, None, None, data
+            return foods, None, None, data
         except Exception as e:
             logger.error(f"Groq Extraction Error: {e}")
             # Final fallback: generic extraction without search if search fails

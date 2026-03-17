@@ -49,6 +49,8 @@ dp = Dispatcher(storage=MemoryStorage())
 app = FastAPI()
 ai_client = genai.Client(api_key=GEMINI_KEY)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# Ensure the client has the apikey header for all requests (redundant but safe)
+supabase.postgrest.auth(SUPABASE_KEY) 
 
 # Custom HTTP Client for general use
 http_client = httpx.AsyncClient(timeout=httpx.Timeout(15.0), follow_redirects=True)
@@ -134,6 +136,7 @@ async def generate_sarcastic_response(user_id: int, message_text: str):
     USUÁRIO DISSE: "{message_text}"
     """
     try:
+        # No global user_history needed here yet as it's not modified
         response = await ai_client.aio.models.generate_content(
             model=AI_MODEL,
             contents=[prompt]
@@ -429,14 +432,26 @@ async def generate_surgical_query(food_name: str) -> str:
     if not GROQ_API_KEY: return food_name
     prompt = f"Transforme '{food_name}' em uma query cirúrgica para encontrar a tabela nutricional oficial. Retorne APENAS a query. Exemplo: (site:fatsecret.com.br OR site:tabelanutricional.com.br) 'tabela nutricional' {food_name}"
     
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-    payload = {"model": "llama-3.1-8b-instant", "messages": [{"role": "user", "content": prompt}]}
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}", 
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "llama-3-70b-8192", 
+        "messages": [{"role": "user", "content": prompt}]
+    }
     try:
-        res = await http_client.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload)
+        # Explicit POST to avoid any accidental GET conversion
+        res = await http_client.post(
+            "https://api.groq.com/openai/v1/chat/completions", 
+            headers=headers, 
+            json=payload,
+            follow_redirects=False
+        )
         if res.status_code == 200:
             return res.json()["choices"][0]["message"]["content"].strip().replace('"', '')
-    except:
-        pass
+    except Exception as e:
+        logger.error(f"Groq surgical query error: {e}")
     return food_name
 
 async def search_fatsecret(food_name: str):
@@ -447,7 +462,13 @@ async def search_fatsecret(food_name: str):
     # Optimize query with Groq
     query = await generate_surgical_query(food_name)
     
-    params = {"method": "foods.search", "search_expression": query, "format": "json", "region": "BR", "max_results": 1}
+    params = {
+        "method": "foods.search", 
+        "search_expression": query, 
+        "format": "json", 
+        "region": "BR", 
+        "max_results": 1
+    }
     headers = {"Authorization": f"Bearer {token}"}
     
     client = get_fs_client()
@@ -455,15 +476,28 @@ async def search_fatsecret(food_name: str):
         res = await client.get(url, params=params, headers=headers)
         if res.status_code == 200:
             data = res.json()
-            foods = data.get("foods", {}).get("food", [])
-            if not foods: return None
+            if "error" in data:
+                logger.error(f"FatSecret API Error: {data['error'].get('message')}")
+                return None
+                
+            foods_data = data.get("foods", {}).get("food", [])
+            if not foods_data: return None
             
-            food_id = foods[0]["food_id"]
+            # Handle both list and dict response
+            if isinstance(foods_data, dict): foods_data = [foods_data]
+            
+            food_id = foods_data[0]["food_id"]
             d_res = await client.get(url, params={"method": "food.get.v2", "food_id": food_id, "format": "json"}, headers=headers)
             if d_res.status_code == 200:
-                d = d_res.json().get("food", {})
+                d_data = d_res.json()
+                if "error" in d_data:
+                    logger.error(f"FatSecret Detail Error: {d_data['error'].get('message')}")
+                    return None
+                    
+                d = d_data.get("food", {})
                 servings = d.get("servings", {}).get("serving", [])
                 if isinstance(servings, dict): servings = [servings]
+                if not servings: return None
                 s = servings[0]
                 
                 result = {
@@ -487,7 +521,7 @@ async def search_fatsecret(food_name: str):
     return None
 
 async def extract_calories_list(user_id: int, message_text: str = "", image_bytes: bytes = None):
-    # Flow: 1. Vector Search Catalog -> 2. FatSecret (if text) -> 3. Gemini Vision
+    # Flow: 1. Vector Search Catalog -> 2. FatSecret (if text) -> 3. Groq (if text) or Gemini (if vision)
     
     # 1. Vector Search
     if message_text:
@@ -498,47 +532,71 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
                 logger.info(f"🎯 Catalog Match: {message_text}")
                 return match, None, None, "Catalog Match"
 
-    # 2. FatSecret (Text only fallback before Vision)
+    # 2. FatSecret (Text only fallback)
     if not image_bytes and message_text:
-        # Use surgical query
         query = await generate_surgical_query(message_text)
         fs_res = await search_fatsecret(query)
         if fs_res:
-            # search_fatsecret now returns a list of dicts or None, and saves to catalog
-            # Wait, let's verify what search_fatsecret returns in our monolith
-            # Looking at my previous turn's multi_replace_file_content... 
-            # It returns [result] which is a list of dicts.
             return fs_res, None, None, "FatSecret Match"
 
-    # 3. Gemini extraction
-    prompt = """
-    Você é um nutricionista especialista. Analise e retorne JSON.
-    SCHEMA: {"foods": [{"alimento": str, "peso": str, "calorias": int, "proteina": float, "carboidratos": float, "gorduras": float, "refeicao": str}], "barcode": str}
-    REGRAS: Normalize os macros para 100g/ml se possível.
-    """
-    contents = [prompt, message_text] if message_text else [prompt]
+    # 3. Model extraction
     if image_bytes:
+        # Use Gemini ONLY for VISION
+        prompt = """
+        Você é um nutricionista especialista. Analise a IMAGEM e retorne JSON.
+        SCHEMA: {"foods": [{"alimento": str, "peso": str, "calorias": int, "proteina": float, "carboidratos": float, "gorduras": float, "refeicao": str}], "barcode": str}
+        REGRAS: Normalize os macros para 100g/ml se possível.
+        """
+        contents = [prompt]
+        if message_text: contents.append(message_text)
         contents.append(ai_types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"))
         
-    try:
-        res = await ai_client.aio.models.generate_content(
-            model=AI_MODEL, contents=contents,
-            config=ai_types.GenerateContentConfig(response_mime_type="application/json")
-        )
-        data = json.loads(res.text)
-        foods = data.get("foods", [])
-        # Save results from Gemini to catalog too if they look precise
-        if not image_bytes and foods and len(foods) == 1:
-            item = foods[0]
-            emb = await get_embedding(item["alimento"])
-            item["embedding"] = emb
-            item["is_precise"] = False # Gemini extractions are estimates
-            save_to_universal_catalog(item)
-            
-        return foods, data.get("barcode"), None, res.text
-    except Exception as e:
-        logger.error(f"Gemini Error: {e}")
-        return [], None, str(e), None
+        try:
+            res = await ai_client.aio.models.generate_content(
+                model=AI_MODEL, contents=contents,
+                config=ai_types.GenerateContentConfig(response_mime_type="application/json")
+            )
+            data = json.loads(res.text)
+            return data.get("foods", []), data.get("barcode"), None, res.text
+        except Exception as e:
+            logger.error(f"Gemini Vision Error: {e}")
+            return [], None, str(e), None
+    
+    elif message_text:
+        # Use Groq for TEXT extraction
+        prompt = f"""
+        Você é um nutricionista especialista. Extraia os alimentos e macros do texto abaixo e retorne APENAS um JSON.
+        TEXTO: "{message_text}"
+        SCHEMA: {{"foods": [{{"alimento": str, "peso": str, "calorias": int, "proteina": float, "carboidratos": float, "gorduras": float, "refeicao": str}}]}}
+        REGRAS: Se não souber o peso, use 100g como base.
+        """
+        headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+        payload = {
+            "model": "llama-3-70b-8192", 
+            "messages": [{"role": "user", "content": prompt}],
+            "response_format": {"type": "json_object"}
+        }
+        try:
+            res = await http_client.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload)
+            if res.status_code == 200:
+                data = res.json()["choices"][0]["message"]["content"]
+                parsed = json.loads(data)
+                foods = parsed.get("foods", [])
+                
+                # Cache precise results
+                if len(foods) == 1:
+                    item = foods[0]
+                    emb = await get_embedding(item["alimento"])
+                    item["embedding"] = emb
+                    item["is_precise"] = False
+                    save_to_universal_catalog(item)
+                
+                return foods, None, None, data
+        except Exception as e:
+            logger.error(f"Groq Extraction Error: {e}")
+            return [], None, str(e), None
+
+    return [], None, None, None
 
 def extract_amount(text: str) -> Optional[float]:
     """Extracts weight (g) or volume (ml) from text. Handles fractions and household measures."""
@@ -1074,56 +1132,6 @@ async def process_report(callback: types.CallbackQuery):
 
 # --- Food and Vision Handling ---
 
-async def process_food_entry(message: types.Message, items: list, raw_data: str):
-    """Common logic for saving and responding to food entries."""
-    if not items:
-        return
-
-    # Log to DB
-    if not log_calories(message.from_user.id, message.from_user.full_name, items):
-        await message.answer("❌ Erro ao salvar dados no Supabase.")
-        return
-    
-    profile = get_user_profile(message.from_user.id)
-    daily_limit = profile['tdee'] if profile else 2000
-    daily_total = get_daily_total(message.from_user.id)
-    
-    items_text = ""
-    for idx, i in enumerate(items):
-        emoji = "🍎" if idx % 2 == 0 else "🥩"
-        meal = f"[{i.get('refeicao', 'Outro')}] "
-        # Se for preciso (Verificado), não mostra tag. Se for impreciso, mostra (estimado).
-        precisao = "" if i.get("is_precise", False) else " ⚠️ *(estimado)*"
-        
-        # Tag especial para Catálogo Universal
-        universal_tag = " 🌐 *(universal)*" if i.get("is_universal") else ""
-        
-        items_text += f"{emoji} {meal}**{i['alimento']}** ({i['peso']}) → {i['calorias']} kcal{precisao}{universal_tag}\n"
-        items_text += f"   └ P: {i.get('proteina', 0)}g | C: {i.get('carboidratos', 0)}g | G: {i.get('gorduras', 0)}g\n"
-        
-    remaining = daily_limit - daily_total
-    progress_val = min(10, round((daily_total/daily_limit)*10)) if daily_limit > 0 else 0
-    progress_bar = "🔵" * progress_val + "⚪" * (10 - progress_val)
-    
-    now_br = get_br_now()
-    data_formatada = now_br.strftime("%d/%m")
-
-    # Feedback Buttons
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ 10%", callback_data="adj_1.1"),
-         InlineKeyboardButton(text="➖ 10%", callback_data="adj_0.9")],
-        [InlineKeyboardButton(text="🔄 Desfazer", callback_data="adj_undo")]
-    ])
-
-    response_text = (
-        f"{items_text}\n"
-        f"📊 **CONTAGEM DE HOJE ({data_formatada})**\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"🔥 Soma: **{daily_total}** / {daily_limit} kcal\n"
-        f"⚖️ Restante: **{max(0, remaining)} kcal**\n\n"
-        f"{progress_bar}"
-    )
-    await message.answer(response_text, parse_mode="Markdown", reply_markup=kb)
 
 # --- Food and Vision Handling ---
 
@@ -1223,6 +1231,7 @@ async def handle_photo(message: types.Message, state: FSMContext):
 
 @dp.message(F.text, StateFilter(None))
 async def handle_text(message: types.Message):
+    global user_history # Ensure global access to avoid NameError
     try:
         msg_id = f"{message.chat.id}:{message.message_id}"
         if msg_id in processed_messages: return

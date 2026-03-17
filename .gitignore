@@ -9,3 +9,4 @@ env/
 .vscode/
 .idea/
 .agent/
+modular_backup/

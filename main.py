@@ -1,17 +1,22 @@
-import asyncio
+import os
+import io
+import re
+import json
 import httpx
-from json import JSONDecodeError
+import asyncio
+import logging
+import time
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 
 import matplotlib.pyplot as plt
 import matplotlib
-matplotlib.use('Agg') # Non-interactive backend
+matplotlib.use('Agg')
 
 from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command, StateFilter, CommandObject
-from aiogram.types import Update, InlineKeyboardMarkup, InlineKeyboardButton, PhotoSize
+from aiogram.filters import Command, StateFilter
+from aiogram.types import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -25,69 +30,65 @@ load_dotenv()
 
 # Logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("CaloriesBot")
 
-# Config
+# Config (No sanitization per user request)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+FATSECRET_CLIENT_ID = os.getenv("FATSECRET_CLIENT_ID")
+FATSECRET_CLIENT_SECRET = os.getenv("FATSECRET_CLIENT_SECRET")
+FATSECRET_PROXIES = [p.strip() for p in os.getenv("FATSECRET_PROXIES", "").split(",") if p.strip()]
 WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL")
 
-# Validation
-missing_vars = []
-if not TELEGRAM_TOKEN: missing_vars.append("TELEGRAM_BOT_TOKEN")
-if not GEMINI_KEY: missing_vars.append("GEMINI_API_KEY")
-if not SUPABASE_URL: missing_vars.append("SUPABASE_URL")
-if not SUPABASE_KEY: missing_vars.append("SUPABASE_KEY")
-if not WEBHOOK_URL: missing_vars.append("RENDER_EXTERNAL_URL")
-
-if missing_vars:
-    error_msg = f"❌ Faltando variáveis de ambiente: {', '.join(missing_vars)}"
-    logger.error(error_msg)
-    raise ValueError(error_msg)
-
-SUPABASE_URL = SUPABASE_URL.strip()
-if not SUPABASE_URL.startswith("https://"):
-    error_msg = f"❌ SUPABASE_URL inválida: {SUPABASE_URL[:10]}..."
-    logger.error(error_msg)
-    raise ValueError(error_msg)
-
-# Init Aiogram
+# Init Clients
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 app = FastAPI()
-
-# Init Gemini (New SDK)
 ai_client = genai.Client(api_key=GEMINI_KEY)
-AI_MODEL = "gemini-1.5-flash" # Modelo padrão para fotos
-AI_MODEL_FALLBACK = "gemini-3.1-flash-lite-preview" # Modelo de alta RPD para fallback
-
-# Init Supabase
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Init Groq (Fallback)
+# Custom HTTP Client for general use
+http_client = httpx.AsyncClient(timeout=httpx.Timeout(15.0), follow_redirects=True)
+
+# FatSecret Proxy Rotation
+fs_proxy_index = 0
+def get_fs_client():
+    global fs_proxy_index
+    if not FATSECRET_PROXIES:
+        return http_client
+    proxy_url = FATSECRET_PROXIES[fs_proxy_index % len(FATSECRET_PROXIES)]
+    fs_proxy_index += 1
+    return httpx.AsyncClient(proxy=proxy_url, timeout=httpx.Timeout(15.0))
+
 groq_client = None
 if GROQ_API_KEY:
     groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 
-# States for Onboarding
+# Constants
+AI_MODEL = "gemini-1.5-flash"
+AI_MODEL_FALLBACK = "gemini-2.0-flash-exp" # Example updated fallback
+
+# States
 class ProfileStates(StatesGroup):
     weight = State()
     height = State()
     age = State()
     gender = State()
     activity = State()
-    goal = State() # NEW: Objetivo (Perder, Manter, Ganhar)
-class BarcodeState(StatesGroup):
-    waiting_for_portion = State() # Esperando o usuário dizer quanto comeu do produto escaneado
+    goal = State()
 
-# Memory and Duplicate protection
+class BarcodeState(StatesGroup):
+    waiting_for_portion = State()
+
+# Global State
 processed_messages = set()
-user_history: Dict[int, List[str]] = {}
-jailbreak_users: Dict[int, bool] = {}
-AI_CACHE: Dict[str, Any] = {} # Simples cache em memória
+fs_token = {"access_token": None, "expires_at": 0}
+fs_lock = asyncio.Lock()
+AI_CACHE = {}
+jailbreak_users = {}
 
 # --- Security Logic ---
 
@@ -155,7 +156,7 @@ def log_calories(user_id: str, user_name: str, items: list):
     try:
         prepared_data = []
         for item in items:
-            prepared_data.append({
+            entry = {
                 "food": item.get("alimento"),
                 "weight": item.get("peso"),
                 "kcal": item.get("calorias"),
@@ -164,9 +165,13 @@ def log_calories(user_id: str, user_name: str, items: list):
                 "fat": item.get("gorduras", 0),
                 "meal_type": item.get("refeicao", "Outro"),
                 "is_precise": item.get("is_precise", False),
+                "confirmations": item.get("confirmations", 0),
                 "user_id": str(user_id),
                 "user_name": user_name
-            })
+            }
+            if item.get("embedding"):
+                entry["embedding"] = item.get("embedding")
+            prepared_data.append(entry)
         if prepared_data:
             supabase.table("logs").insert(prepared_data).execute()
         return True
@@ -174,8 +179,59 @@ def log_calories(user_id: str, user_name: str, items: list):
         logger.error(f"Erro ao salvar no Supabase: {e}")
         return False
 
+def save_to_universal_catalog(item: dict):
+    """Saves a verified food item to the catalog to prevent redundant AI calls."""
+    try:
+        food_name = item.get("alimento")
+        check = supabase.table("universal_catalog").select("id").eq("food", food_name).limit(1).execute()
+        if check.data:
+            return True
+            
+        data = {
+            "food": food_name,
+            "kcal": float(item.get("calorias", 0)),
+            "protein": float(item.get("proteina", 0)),
+            "carbs": float(item.get("carboidratos", 0)),
+            "fat": float(item.get("gorduras", 0)),
+            "serving_size": item.get("peso", "100g"),
+            "embedding": item.get("embedding"),
+            "confirmations": item.get("confirmations", 1),
+            "is_precise": item.get("is_precise", True)
+        }
+        supabase.table("universal_catalog").insert(data).execute()
+        logger.info(f"✅ Item '{food_name}' salvo no Catálogo Universal.")
+        return True
+    except Exception as e:
+        logger.error(f"Erro ao salvar no catálogo: {e}")
+        return False
+
+def search_universal_catalog(query_embedding: list, threshold: float = 0.85):
+    """Performs semantic search in the universal_catalog table."""
+    try:
+        res = supabase.rpc("match_food_catalog", {
+            "query_embedding": query_embedding,
+            "match_threshold": threshold,
+            "match_count": 1
+        }).execute()
+        
+        if res.data:
+            item = res.data[0]
+            return [{
+                "alimento": item.get("food"),
+                "peso": item.get("serving_size", "100g"),
+                "calorias": item.get("kcal", 0),
+                "proteina": item.get("protein", 0),
+                "carboidratos": item.get("carbs", 0),
+                "gorduras": item.get("fat", 0),
+                "is_precise": True,
+                "is_universal": True
+            }]
+        return None
+    except Exception as e:
+        logger.error(f"Erro na busca vetorial: {e}")
+        return None
+
 def get_user_profile(user_id: str):
-    """Fetches the user's profile and TDEE."""
     try:
         res = supabase.table("profiles").select("*").eq("user_id", str(user_id)).execute()
         return res.data[0] if res.data else None
@@ -184,10 +240,8 @@ def get_user_profile(user_id: str):
         return None
 
 def get_daily_total(user_id: str):
-    """Calculates the total calories for the current day using Brazil Time (UTC-3)."""
     try:
         today_br_start = get_br_today_start()
-        
         response = supabase.table("logs") \
             .select("kcal") \
             .eq("user_id", str(user_id)) \
@@ -203,19 +257,18 @@ def get_report_data(user_id: str, days: int):
     try:
         now_br = get_br_now()
         start_date = (now_br - timedelta(days=days)).strftime("%Y-%m-%dT00:00:00-03:00")
-        
-        response = supabase.table("logs") \
-            .select("created_at, kcal") \
+        res = supabase.table("logs") \
+            .select("created_at, kcal, protein, carbs, fat") \
             .eq("user_id", str(user_id)) \
             .gte("created_at", start_date) \
             .execute()
-        return response.data
+        return res.data or []
     except Exception as e:
         logger.error(f"Erro ao buscar dados do relatório: {e}")
         return []
 
 def delete_last_log(user_id: str):
-    """Deletes the most recent meal log (all items from last entry message)."""
+    """Deletes the most recent meal log."""
     try:
         res = supabase.table("logs") \
             .select("id, created_at") \
@@ -223,7 +276,6 @@ def delete_last_log(user_id: str):
             .order("created_at", desc=True) \
             .limit(1) \
             .execute()
-        
         if res.data:
             created_at = res.data[0]['created_at']
             supabase.table("logs").delete() \
@@ -236,173 +288,159 @@ def delete_last_log(user_id: str):
         logger.error(f"Erro ao deletar último log: {e}")
         return False
 
-def delete_today_logs(user_id: str):
-    """Deletes all logs from the current day."""
+# --- AI & Search Logic ---
+
+async def get_embedding(text: str):
+    """Generates a embedding using gemini text-embedding-004."""
     try:
-        today_br_start = get_br_today_start()
-        
-        supabase.table("logs").delete() \
-            .eq("user_id", str(user_id)) \
-            .gte("created_at", today_br_start) \
-            .execute()
-        return True
-    except Exception as e:
-        logger.error(f"Erro ao deletar logs de hoje: {e}")
-        return False
-
-def delete_entire_profile(user_id: str):
-    """Deletes profile and all logs for a user."""
-    try:
-        # Delete logs first (foreign key/consistency)
-        supabase.table("logs").delete().eq("user_id", str(user_id)).execute()
-        # Delete profile
-        supabase.table("profiles").delete().eq("user_id", str(user_id)).execute()
-        return True
-    except Exception as e:
-        logger.error(f"Erro ao deletar perfil completo: {e}")
-        return False
-
-def search_food_history(user_id: str, food_query: str):
-    """
-    Searches for a historical log entry that matches the message text exactly.
-    Returns the items list if found, otherwise None.
-    """
-    try:
-        # Busca a última entrada desse usuário com esse exato texto
-        # Precisamos buscar entradas que tenham o mesmo texto de entrada na memória da IA ou algo similar
-        # Por enquanto, vamos focar em entradas idênticas para máxima precisão.
-        
-        # Como o food_query pode ser longo, vamos tentar buscar no 'alimento' se for uma palavra só
-        # ou ver se temos um log recente (últimos 30 dias) com esse padrão.
-        
-        # Estratégia: Buscar no Supabase logs onde o nome do alimento bate.
-        # Priorizamos a entrada mais recente para refletir a última validação feita.
-        
-        # Tenta busca exata primeiro
-        res = supabase.table("logs") \
-            .select("food, weight, kcal, protein, carbs, fat, meal_type, is_precise") \
-            .eq("user_id", str(user_id)) \
-            .ilike("food", f"{food_query}") \
-            .order("created_at", desc=True) \
-            .limit(1) \
-            .execute()
-        
-        # Se não achar exato, tenta aproximação (Fuzzy simples)
-        if not res.data:
-            res = supabase.table("logs") \
-                .select("food, weight, kcal, protein, carbs, fat, meal_type, is_precise") \
-                .eq("user_id", str(user_id)) \
-                .ilike("food", f"%{food_query}%") \
-                .order("created_at", desc=True) \
-                .limit(1) \
-                .execute()
-            if res.data:
-                res.data[0]["is_approximate"] = True # Marca como aproximado
-
-        # PASSO 2: Se não achou NADA pessoal, busca no catálogo GLOBAL por itens VERIFICADOS
-        is_universal = False
-        if not res.data:
-            res = supabase.table("logs") \
-                .select("food, weight, kcal, protein, carbs, fat, meal_type, is_precise") \
-                .eq("is_precise", True) \
-                .ilike("food", f"{food_query}") \
-                .order("created_at", desc=True) \
-                .limit(1) \
-                .execute()
-            if res.data:
-                is_universal = True
-                logger.info(f"Item encontrado no Catálogo Universal: {food_query}")
-
-        if res.data:
-            item = res.data[0]
-            return [{
-                "alimento": item["food"],
-                "peso": item["weight"],
-                "calorias": item["kcal"],
-                "proteina": item["protein"],
-                "carboidratos": item["carbs"],
-                "gorduras": item["fat"],
-                "refeicao": item["meal_type"],
-                "is_precise": item.get("is_precise", False),
-                "is_approximate": item.get("is_approximate", False),
-                "is_universal": is_universal
-            }]
-        return None
-    except Exception as e:
-        logger.error(f"Erro ao buscar no histórico: {e}")
-        return None
-
-
-def extract_weight_in_grams(weight_text: str) -> Optional[float]:
-    """Extracts weight in grams from a free text field like '200g' or '1 porção (150 g)'."""
-    if not weight_text:
-        return None
-
-    match = re.search(r"(\d+[\.,]?\d*)\s*g", str(weight_text).lower())
-    if not match:
-        return None
-
-    try:
-        return float(match.group(1).replace(",", "."))
-    except ValueError:
-        return None
-
-
-# --- AI Logic ---
-
-async def call_gemini_with_retry(contents, config=None, max_retries=3):
-    """Calls Gemini with exponential backoff for 429 errors."""
-    for i in range(max_retries):
-        try:
-            # Use .aio for non-blocking calls
-            response = await ai_client.aio.models.generate_content(
-                model=AI_MODEL,
-                contents=contents,
-                config=config
-            )
-            return response
-        except Exception as e:
-            if "429" in str(e) and i < max_retries - 1:
-                wait_time = (2 ** i) + 1
-                logger.warning(f"Gemini 429 Detectado. Tentando novamente em {wait_time}s... (Tentativa {i+1}/{max_retries})")
-                await asyncio.sleep(wait_time)
-                continue
-            raise e
-
-async def call_groq_fallback(message_text: str, image_bytes: Optional[bytes] = None, prompt: str = ""):
-    """Calls Groq (Llama 3.2 Vision) as a fallback."""
-    if not groq_client:
-        return None
-    
-    try:
-        import base64
-        # Usamos o modelo mais rápido e versátil para texto
-        model = "llama-3.3-70b-versatile" 
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                ]
-            }
-        ]
-        
-        if image_bytes:
-            base64_image = base64.b64encode(image_bytes).decode('utf-8')
-            messages[0]["content"].append({
-                "type": "image_url",
-                "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
-            })
-            
-        completion = await groq_client.chat.completions.create(
-            model=model,
-            messages=messages,
-            response_format={"type": "json_object"}
+        res = await ai_client.aio.models.embed_content(
+            model="text-embedding-004",
+            contents=[text]
         )
-        return completion.choices[0].message.content
+        return res.embeddings[0].values
     except Exception as e:
-        logger.error(f"Erro no fallback Groq: {e}")
+        logger.error(f"Erro embedding: {e}")
         return None
+
+async def get_fatsecret_token():
+    global fs_token
+    now = time.time()
+    if fs_token.get("access_token") and now < fs_token.get("expires_at", 0):
+        return fs_token["access_token"]
+    
+    async with fs_lock:
+        if fs_token.get("access_token") and now < fs_token.get("expires_at", 0):
+            return fs_token["access_token"]
+            
+        url = "https://oauth.fatsecret.com/connect/token"
+        data = {"grant_type": "client_credentials", "scope": "basic"}
+        auth = (FATSECRET_CLIENT_ID, FATSECRET_CLIENT_SECRET)
+        
+        client = get_fs_client()
+        try:
+            res = await client.post(url, data=data, auth=auth)
+            if res.status_code == 200:
+                d = res.json()
+                fs_token["access_token"] = d["access_token"]
+                fs_token["expires_at"] = now + d["expires_in"] - 60
+                return fs_token["access_token"]
+        except Exception as e:
+            logger.error(f"FatSecret Token Error: {e}")
+        finally:
+            if client is not http_client: await client.aclose()
+    return None
+
+async def generate_surgical_query(food_name: str) -> str:
+    """Uses Groq to transform name into a surgical search query."""
+    if not GROQ_API_KEY: return food_name
+    prompt = f"Transforme '{food_name}' em uma query cirúrgica para encontrar a tabela nutricional oficial. Retorne APENAS a query. Exemplo: (site:fatsecret.com.br OR site:tabelanutricional.com.br) 'tabela nutricional' {food_name}"
+    
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    payload = {"model": "llama-3.1-8b-instant", "messages": [{"role": "user", "content": prompt}]}
+    try:
+        res = await http_client.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload)
+        if res.status_code == 200:
+            return res.json()["choices"][0]["message"]["content"].strip().replace('"', '')
+    except:
+        pass
+    return food_name
+
+async def search_fatsecret(food_name: str):
+    token = await get_fatsecret_token()
+    if not token: return None
+    
+    url = "https://platform.fatsecret.com/rest/server.api"
+    # Optimize query with Groq
+    query = await generate_surgical_query(food_name)
+    
+    params = {"method": "foods.search", "search_expression": query, "format": "json", "region": "BR", "max_results": 1}
+    headers = {"Authorization": f"Bearer {token}"}
+    
+    client = get_fs_client()
+    try:
+        res = await client.get(url, params=params, headers=headers)
+        if res.status_code == 200:
+            data = res.json()
+            foods = data.get("foods", {}).get("food", [])
+            if not foods: return None
+            
+            food_id = foods[0]["food_id"]
+            d_res = await client.get(url, params={"method": "food.get.v2", "food_id": food_id, "format": "json"}, headers=headers)
+            if d_res.status_code == 200:
+                d = d_res.json().get("food", {})
+                servings = d.get("servings", {}).get("serving", [])
+                if isinstance(servings, dict): servings = [servings]
+                s = servings[0]
+                
+                result = {
+                    "alimento": d.get("food_name"),
+                    "calorias": float(s.get("calories", 0)),
+                    "proteina": float(s.get("protein", 0)),
+                    "carboidratos": float(s.get("carbohydrate", 0)),
+                    "gorduras": float(s.get("fat", 0)),
+                    "peso": "100g",
+                    "is_precise": True
+                }
+                # Save to catalog logic
+                emb = await get_embedding(result["alimento"])
+                result["embedding"] = emb
+                save_to_universal_catalog(result)
+                return [result]
+    except Exception as e:
+        logger.error(f"FatSecret Search Error: {e}")
+    finally:
+        if client is not http_client: await client.aclose()
+    return None
+
+async def extract_calories_list(user_id: int, message_text: str = "", image_bytes: bytes = None):
+    # Flow: 1. Vector Search Catalog -> 2. FatSecret (if text) -> 3. Gemini Vision
+    
+    # 1. Vector Search
+    if message_text:
+        emb = await get_embedding(message_text)
+        if emb:
+            match = search_universal_catalog(emb)
+            if match:
+                logger.info(f"🎯 Catalog Match: {message_text}")
+                return match, None, None, "Catalog Match"
+
+    # 2. FatSecret (Text only fallback before Vision)
+    if not image_bytes and message_text:
+        fs_res = await search_fatsecret(message_text)
+        if fs_res:
+            return fs_res, None, None, "FatSecret Match"
+
+    # 3. Gemini extraction
+    prompt = """
+    Você é um nutricionista. Analise e retorne JSON.
+    SCHEMA: {"foods": [{"alimento": str, "peso": str, "calorias": int, "proteina": float, "carboidratos": float, "gorduras": float, "refeicao": str}], "barcode": str}
+    """
+    contents = [prompt, message_text] if message_text else [prompt]
+    if image_bytes:
+        contents.append(ai_types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"))
+        
+    try:
+        res = await ai_client.aio.models.generate_content(
+            model=AI_MODEL, contents=contents,
+            config=ai_types.GenerateContentConfig(response_mime_type="application/json")
+        )
+        data = json.loads(res.text)
+        return data.get("foods", []), data.get("barcode"), None, res.text
+    except Exception as e:
+        logger.error(f"Gemini Error: {e}")
+        return [], None, str(e), None
+
+def calculate_tdee(weight, height, age, gender, activity, goal):
+    # Mifflin-St Jeor
+    if gender == 'M': bmr = 10 * weight + 6.25 * height - 5 * age + 5
+    else: bmr = 10 * weight + 6.25 * height - 5 * age - 161
+    
+    mult = {'sedentario': 1.2, 'leve': 1.375, 'moderado': 1.55, 'ativo': 1.725, 'atleta': 1.9}
+    tdee = bmr * mult.get(activity, 1.2)
+    
+    if goal == 'perder': tdee -= 500
+    elif goal == 'ganhar': tdee += 500
+    return round(tdee)
 
 async def get_barcode_data(barcode: str):
     """Fetches nutritional data from OpenFoodFacts."""
@@ -592,28 +630,7 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
 
 # --- Mifflin-St Jeor ---
 
-def calculate_tdee(w, h, a, g, act, goal="manter"):
-    # BMR (Mifflin-St Jeor)
-    if g == 'M':
-        bmr = (10 * w) + (6.25 * h) - (5 * a) + 5
-    else:
-        bmr = (10 * w) + (6.25 * h) - (5 * a) - 161
-    
-    multipliers = {
-        "sedentario": 1.2,
-        "leve": 1.375,
-        "moderado": 1.55,
-        "ativo": 1.725,
-        "atleta": 1.9
-    }
-    tdee = bmr * multipliers.get(act, 1.2)
-    
-    # Adjust based on Goal
-    if goal == "perder":
-        return round(tdee - 500)
-    elif goal == "ganhar":
-        return round(tdee + 300)
-    return round(tdee)
+# calculate_tdee already defined above
 
 # --- Bot Handlers ---
 

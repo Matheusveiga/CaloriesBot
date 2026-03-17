@@ -476,6 +476,7 @@ async def search_fatsecret(food_name: str):
         "search_expression": query, 
         "format": "json", 
         "region": "BR", 
+        "language": "pt",
         "max_results": 1
     }
     headers = {"Authorization": f"Bearer {token}"}
@@ -485,6 +486,8 @@ async def search_fatsecret(food_name: str):
         res = await client.get(url, params=params, headers=headers)
         if res.status_code == 200:
             data = res.json()
+            logger.info(f"FatSecret Raw Search Result: {json.dumps(data, ensure_ascii=False)}")
+            
             if "error" in data:
                 logger.error(f"FatSecret API Error: {data['error'].get('message')}")
                 return None
@@ -496,10 +499,11 @@ async def search_fatsecret(food_name: str):
             if isinstance(foods_data, dict): foods_data = [foods_data]
             
             food_id = foods_data[0]["food_id"]
-            # CRITICAL: Always include region in food.get.v2
-            d_res = await client.get(url, params={"method": "food.get.v2", "food_id": food_id, "format": "json", "region": "BR"}, headers=headers)
+            # CRITICAL: Always include region AND language in food.get.v2
+            d_res = await client.get(url, params={"method": "food.get.v2", "food_id": food_id, "format": "json", "region": "BR", "language": "pt"}, headers=headers)
             if d_res.status_code == 200:
                 d_data = d_res.json()
+                logger.info(f"FatSecret Raw Detail Result: {json.dumps(d_data, ensure_ascii=False)}")
                 if "error" in d_data:
                     logger.error(f"FatSecret Detail Error: {d_data['error'].get('message')}")
                     return None

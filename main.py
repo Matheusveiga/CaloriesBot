@@ -445,15 +445,15 @@ async def generate_surgical_query(food_name: str) -> str:
     
     prompt = (
         f"Extraia APENAS o nome do alimento do texto: '{food_name}'. "
-        f"Remova quantidades, medidas (como 'fatias', 'gramas') ou pronomes. "
-        f"Exemplo: se o texto for 'comi 2 fatias de pão de forma visconti', "
-        f"retorne APENAS 'pão de forma visconti'."
+        "Não inclua explicações, quantidades (como fatias, g, ml), ou pontuação. "
+        "Retorne apenas as palavras que identificam o produto. "
+        "Exemplo: '2 fatias de pão visconti' -> 'pão visconti'"
     )
     
     try:
         completion = await groq_client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
-            model="llama-3.3-70b-versatile",
+            model="llama-3.1-8b-instant", # Faster for simple cleanup
             temperature=0,
         )
         clean_food = completion.choices[0].message.content.strip().replace('"', '')
@@ -496,7 +496,8 @@ async def search_fatsecret(food_name: str):
             if isinstance(foods_data, dict): foods_data = [foods_data]
             
             food_id = foods_data[0]["food_id"]
-            d_res = await client.get(url, params={"method": "food.get.v2", "food_id": food_id, "format": "json"}, headers=headers)
+            # CRITICAL: Always include region in food.get.v2
+            d_res = await client.get(url, params={"method": "food.get.v2", "food_id": food_id, "format": "json", "region": "BR"}, headers=headers)
             if d_res.status_code == 200:
                 d_data = d_res.json()
                 if "error" in d_data:
@@ -527,34 +528,40 @@ async def search_fatsecret(food_name: str):
         logger.error(f"FatSecret Search Error: {e}")
     finally:
         if client is not http_client: await client.aclose()
-    return None
-
 async def extract_calories_list(user_id: int, message_text: str = "", image_bytes: bytes = None):
-    # Flow: 1. Vector Search Catalog -> 2. FatSecret (if text) -> 3. Groq (if text) or Gemini (if vision)
+    # Flow: 1. Search (Catalog + FatSecret) -> 2. Contextual Extraction (Groq/Gemini scales everything)
     
-    # 1. Vector Search
-    if message_text:
+    search_context = []
+    
+    # 1. Search Catalog (Vector)
+    if message_text and not image_bytes:
         emb = await get_embedding(message_text)
         if emb:
             match = search_universal_catalog(emb)
             if match:
-                logger.info(f"🎯 Catalog Match: {message_text}")
-                return match, None, None, "Catalog Match"
+                logger.info(f"🎯 Catalog Context Hit: {message_text}")
+                search_context.extend(match)
 
-    # 2. FatSecret (Text only fallback)
+    # 2. Search FatSecret (Text only fallback)
     if not image_bytes and message_text:
         query = await generate_surgical_query(message_text)
         fs_res = await search_fatsecret(query)
         if fs_res:
-            return fs_res, None, None, "FatSecret Match"
+            logger.info(f"🔍 FatSecret Context Hit: {query}")
+            search_context.extend(fs_res)
 
-    # 3. Model extraction
+    # 3. Model extraction with Context
     if image_bytes:
         # Use Gemini ONLY for VISION
-        prompt = """
+        prompt = f"""
         Você é um nutricionista especialista. Analise a IMAGEM e retorne JSON.
-        SCHEMA: {"foods": [{"alimento": str, "peso": str, "calorias": int, "proteina": float, "carboidratos": float, "gorduras": float, "refeicao": str}], "barcode": str}
-        REGRAS: Normalize os macros para 100g/ml se possível.
+        DADOS DE BUSCA (Se houver): {json.dumps(search_context, ensure_ascii=False)}
+        
+        SCHEMA: {{"foods": [{{"alimento": str, "peso": str, "calorias": int, "proteina": float, "carboidratos": float, "gorduras": float, "refeicao": str}}], "barcode": str}}
+        REGRAS: 
+        1. Se houver dados de busca compatíveis, USE-OS como base para calibrar os macros.
+        2. ESCALE os valores para a quantidade que você ver na imagem ou ler no texto.
+        3. Se não houver peso, use 100g.
         """
         contents = [prompt]
         if message_text: contents.append(message_text)
@@ -572,21 +579,24 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
             return [], None, str(e), None
     
     elif message_text:
-        # 3. Use Groq for TEXT extraction (no image)
+        # Use Groq for TEXT extraction + scaling
         if not groq_client: return [], None, "Groq client not init", None
 
-        # Base prompt for extraction
-        base_prompt = """
-        Você é um nutricionista especialista. Extraia os alimentos e seus macros (kcal, proteina, carboidratos, gorduras).
-        Retorne APENAS um objeto JSON com a chave "itens" contendo uma lista.
-        Exemplo: {"itens": [{"alimento": "pão", "peso": "50g", "calorias": 130, "proteina": 4.5, "carboidratos": 25, "gorduras": 1.5, "refeicao": "Café da Manhã", "is_precise": true}]}
-        Se o peso não for informado, use 100g como padrão.
-        """
+        prompt = f"""
+        Você é um nutricionista especialista. Extraia os alimentos e seus macros do texto usuario.
+        USE OS DADOS DE BUSCA ABAIXO COMO REFERÊNCIA DE CALORIAS POR PORÇÃO.
         
-        # We don't have search_results here if search_fatsecret wasn't called or failed, 
-        # but in this flow FatSecret was already tried above.
-        # If we reach here, we are doing a "pure" LLM extraction or using it as a final fallback.
-        prompt = f"{base_prompt}\n\nTexto do usuário: '{message_text}'"
+        DADOS DE BUSCA: {json.dumps(search_context, ensure_ascii=False)}
+        TEXTO DO USUÁRIO: "{message_text}"
+
+        REGRAS:
+        1. Identifique a quantidade no texto (ex: "2 fatias").
+        2. Use os DADOS DE BUSCA para saber quanto vale 1 porção/100g.
+        3. FAÇA A CONTA e retorne os macros ajustados para a quantidade do usuário.
+        4. Retorne APENAS um objeto JSON com a chave "itens".
+        
+        SCHEMA: {{"itens": [{{"alimento": str, "peso": str, "calorias": int, "proteina": float, "carboidratos": float, "gorduras": float, "refeicao": str, "is_precise": bool}}]}}
+        """
         
         try:
             completion = await groq_client.chat.completions.create(
@@ -598,14 +608,9 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
             data = completion.choices[0].message.content
             parsed = json.loads(data)
             foods = parsed.get("itens") or parsed.get("foods") or []
-            if foods:
-                return foods, None, None, data
             return foods, None, None, data
         except Exception as e:
-            logger.error(f"Groq Extraction Error: {e}")
-            # Final fallback: generic extraction without search if search fails
-            if "FatSecret" in str(e) or "Search" in str(e):
-                pass 
+            logger.error(f"Groq Unified Extraction Error: {e}")
             return [], None, str(e), None
 
     return [], None, None, None

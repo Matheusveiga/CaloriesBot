@@ -143,7 +143,19 @@ async def generate_sarcastic_response(user_id: int, message_text: str):
         )
         return response.text.strip()
     except Exception as e:
-        logger.error(f"Erro ao gerar sarcasmo: {e}")
+        logger.warning(f"Gemini sarcasm fallback to Groq: {e}")
+        # Fallback to Groq for sarcasm
+        if GROQ_API_KEY:
+            try:
+                headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+                payload = {
+                    "model": "llama-3.3-70b-versatile", 
+                    "messages": [{"role": "user", "content": prompt}]
+                }
+                res = await http_client.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, follow_redirects=False)
+                if res.status_code == 200:
+                    return res.json()["choices"][0]["message"]["content"].strip()
+            except: pass
         return "Ah, que original. Outra tentativa brilhante. 🙄"
 
 # --- Timezone Helpers ---
@@ -176,15 +188,15 @@ def log_calories(user_id: str, user_name: str, items: list):
             entry = {
                 "food": item.get("alimento"),
                 "weight": item.get("peso"),
-                "kcal": item.get("calorias"),
-                "protein": item.get("proteina", 0),
-                "carbs": item.get("carboidratos", 0),
-                "fat": item.get("gorduras", 0),
+                "kcal": int(float(item.get("calorias", 0))),
+                "protein": int(float(item.get("proteina", 0))),
+                "carbs": int(float(item.get("carboidratos", 0))),
+                "fat": int(float(item.get("gorduras", 0))),
                 "meal_type": item.get("refeicao", "Outro"),
                 "is_precise": item.get("is_precise", False),
-                "confirmations": item.get("confirmations", 0),
+                "confirmations": int(item.get("confirmations", 0)),
                 "user_id": str(user_id),
-                "user_name": user_name
+                "user_name": str(user_name)
             }
             if item.get("embedding"):
                 entry["embedding"] = item.get("embedding")
@@ -206,14 +218,14 @@ def save_to_universal_catalog(item: dict):
             
         data = {
             "food": food_name,
-            "kcal": float(item.get("calorias", 0)),
-            "protein": float(item.get("proteina", 0)),
-            "carbs": float(item.get("carboidratos", 0)),
-            "fat": float(item.get("gorduras", 0)),
-            "serving_size": item.get("peso", "100g"),
+            "kcal": int(float(item.get("calorias", 0))),
+            "protein": int(float(item.get("proteina", 0))),
+            "carbs": int(float(item.get("carboidratos", 0))),
+            "fat": int(float(item.get("gorduras", 0))),
+            "serving_size": str(item.get("peso", "100g")),
             "embedding": item.get("embedding"),
-            "confirmations": item.get("confirmations", 1),
-            "is_precise": item.get("is_precise", True)
+            "confirmations": int(item.get("confirmations", 1)),
+            "is_precise": bool(item.get("is_precise", True))
         }
         supabase.table("universal_catalog").insert(data).execute()
         logger.info(f"✅ Item '{food_name}' salvo no Catálogo Universal.")
@@ -437,7 +449,7 @@ async def generate_surgical_query(food_name: str) -> str:
         "Content-Type": "application/json"
     }
     payload = {
-        "model": "llama-3-70b-8192", 
+        "model": "llama-3.3-70b-versatile", 
         "messages": [{"role": "user", "content": prompt}]
     }
     try:
@@ -572,12 +584,17 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
         """
         headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
         payload = {
-            "model": "llama-3-70b-8192", 
+            "model": "llama-3.3-70b-versatile", 
             "messages": [{"role": "user", "content": prompt}],
             "response_format": {"type": "json_object"}
         }
         try:
-            res = await http_client.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload)
+            res = await http_client.post(
+                "https://api.groq.com/openai/v1/chat/completions", 
+                headers=headers, 
+                json=payload,
+                follow_redirects=False
+            )
             if res.status_code == 200:
                 data = res.json()["choices"][0]["message"]["content"]
                 parsed = json.loads(data)
@@ -594,6 +611,9 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
                 return foods, None, None, data
         except Exception as e:
             logger.error(f"Groq Extraction Error: {e}")
+            # Final fallback: generic extraction without search if search fails
+            if "FatSecret" in str(e) or "Search" in str(e):
+                pass 
             return [], None, str(e), None
 
     return [], None, None, None

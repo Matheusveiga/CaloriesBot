@@ -19,8 +19,8 @@ logger = logging.getLogger("CaloriesBot")
 # Config
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
-SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().replace('"', '').replace("'", "")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip().replace('"', '').replace("'", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 SERPER_API_KEY = os.getenv("SERPER_API_KEY") 
 FATSECRET_CLIENT_ID = os.getenv("FATSECRET_CLIENT_ID")
@@ -54,6 +54,7 @@ dp = Dispatcher(storage=MemoryStorage())
 fastapi_app = FastAPI()
 ai_client = genai.Client(api_key=GEMINI_KEY)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+logger.info(f"💾 Supabase: Cliente iniciado (URL: {SUPABASE_URL[:15]}..., Key: {SUPABASE_KEY[:10]}...)")
 http_client = httpx.AsyncClient(timeout=httpx.Timeout(10.0))
 
 # FatSecret Proxy Config

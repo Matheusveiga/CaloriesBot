@@ -2,7 +2,7 @@ import json
 import httpx
 import asyncio
 from ddgs import DDGS
-from app.config import logger, groq_client, SERPER_API_KEY, FATSECRET_CLIENT_ID, FATSECRET_CLIENT_SECRET, fs_token, http_client
+from app.config import logger, groq_client, SERPER_API_KEY, FATSECRET_CLIENT_ID, FATSECRET_CLIENT_SECRET, FATSECRET_PROXIES, fs_token, http_client
 
 fs_lock = asyncio.Lock()
 

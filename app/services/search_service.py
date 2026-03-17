@@ -25,7 +25,13 @@ async def get_fatsecret_token():
             return None
             
         url = "https://oauth.fatsecret.com/connect/token"
-        data = {"grant_type": "client_credentials", "scope": "basic"}
+        data = {
+            "grant_type": "client_credentials", 
+            "scope": "basic",
+            "client_id": FATSECRET_CLIENT_ID,
+            "client_secret": FATSECRET_CLIENT_SECRET
+        }
+        # Keep auth for backward compatibility
         auth = (FATSECRET_CLIENT_ID, FATSECRET_CLIENT_SECRET)
         
         # Try with up to 3 different proxies if there's a connection error
@@ -181,12 +187,22 @@ async def generate_surgical_query(food_name: str) -> str:
     
     ALIMENTO: "{food_name}"
     """
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "llama-3.1-8b-instant",
+        "messages": [{"role": "user", "content": prompt}]
+    }
     try:
-        res = await groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[{"role": "user", "content": prompt}]
-        )
-        return res.choices[0].message.content.strip().replace('"', '')
+        response = await http_client.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload)
+        if response.status_code == 200:
+            data = response.json()
+            return data["choices"][0]["message"]["content"].strip().replace('"', '')
+        else:
+            logger.error(f"Erro Direto Groq ({response.status_code}): {response.text}")
+            return food_name
     except:
         return food_name
 

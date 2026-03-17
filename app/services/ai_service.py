@@ -28,15 +28,26 @@ async def call_groq_fallback(message_text: str, image_bytes=None, prompt: str = 
     """Calls Groq (Llama 3.3) as a fallback, optionally with search context."""
     if not groq_client: return None
     full_prompt = f"{prompt}\nCONTEXTO DE BUSCA ADICIONAL:\n{search_context}\n\nENTRADA: {message_text}"
+    from app.config import GROQ_API_KEY, http_client
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "llama-3.3-70b-versatile",
+        "messages": [{"role": "user", "content": full_prompt}],
+        "response_format": {"type": "json_object"}
+    }
     try:
-        response = await groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": full_prompt}],
-            response_format={"type": "json_object"}
-        )
-        return response.choices[0].message.content
+        response = await http_client.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload)
+        if response.status_code == 200:
+            data = response.json()
+            return data["choices"][0]["message"]["content"]
+        else:
+            logger.error(f"Erro Direto Groq Fallback ({response.status_code}): {response.text}")
+            return None
     except Exception as e:
-        logger.error(f"Erro no Groq Fallback: {e}")
+        logger.error(f"Erro no Groq Fallback (Exception): {e}")
         return None
 
 async def extract_calories_list(user_id: int, message_text: str = "", image_bytes=None):

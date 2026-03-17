@@ -129,7 +129,8 @@ async def cmd_status(message: types.Message):
     remaining = daily_limit - daily_total
     today_br_start = get_br_today_start()
     res = supabase.table("logs").select("*").eq("user_id", str(user_id)).gte("created_at", today_br_start).order("created_at", desc=True).execute()
-    items_list_text = "".join([f"• {item['food']} ({item['kcal']} kcal)\n" for item in res.data]) or "_Nenhum alimento logado hoje._\n"
+    data_list = res.data if res and hasattr(res, 'data') else []
+    items_list_text = "".join([f"• {item.get('food', '?')} ({item.get('kcal', 0)} kcal)\n" for item in data_list]) or "_Nenhum alimento logado hoje._\n"
     progress_val = min(10, round((daily_total/daily_limit)*10)) if daily_limit > 0 else 0
     progress_bar = "🔵" * progress_val + "⚪" * (10 - progress_val)
     status_msg = (

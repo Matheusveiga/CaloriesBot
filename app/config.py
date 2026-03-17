@@ -17,15 +17,15 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("CaloriesBot")
 
 # Config
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GEMINI_KEY = os.getenv("GEMINI_API_KEY")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip().replace('"', '').replace("'", "")
+GEMINI_KEY = os.getenv("GEMINI_API_KEY", "").strip().replace('"', '').replace("'", "")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().replace('"', '').replace("'", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip().replace('"', '').replace("'", "")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-SERPER_API_KEY = os.getenv("SERPER_API_KEY") 
-FATSECRET_CLIENT_ID = os.getenv("FATSECRET_CLIENT_ID")
-FATSECRET_CLIENT_SECRET = os.getenv("FATSECRET_CLIENT_SECRET")
-FATSECRET_PROXIES = [p.strip() for p in os.getenv("FATSECRET_PROXIES", "").split(",") if p.strip()]
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip().replace('"', '').replace("'", "")
+SERPER_API_KEY = os.getenv("SERPER_API_KEY", "").strip().replace('"', '').replace("'", "")
+FATSECRET_CLIENT_ID = os.getenv("FATSECRET_CLIENT_ID", "").strip().replace('"', '').replace("'", "")
+FATSECRET_CLIENT_SECRET = os.getenv("FATSECRET_CLIENT_SECRET", "").strip().replace('"', '').replace("'", "")
+FATSECRET_PROXIES = [p.strip().replace('"', '').replace("'", "") for p in os.getenv("FATSECRET_PROXIES", "").split(",") if p.strip()]
 WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL")
 
 # Validation
@@ -53,11 +53,23 @@ bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 fastapi_app = FastAPI()
 ai_client = genai.Client(api_key=GEMINI_KEY)
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# Supabase Client with explicit headers for reliability
+from httpx import AsyncClient
+supabase: Client = create_client(
+    SUPABASE_URL, 
+    SUPABASE_KEY
+)
+# Injecting headers manually to ensure reliability on Render if needed
+supabase.options.headers.update({
+    "apikey": SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}"
+})
+
 # Verifica se a chave tem o tamanho esperado de uma anon key do Supabase (~120+ chars)
 key_type = "VÁLIDA (Parece Anon Key)" if len(SUPABASE_KEY) > 100 else "INVÁLIDA (MUITO CURTA)"
 logger.info(f"💾 Supabase: URL={SUPABASE_URL[:15]}... | Key={SUPABASE_KEY[:10]}... | Status={key_type} | Len={len(SUPABASE_KEY)}")
-http_client = httpx.AsyncClient(timeout=httpx.Timeout(10.0))
+http_client = httpx.AsyncClient(timeout=httpx.Timeout(15.0), follow_redirects=True)
 
 # FatSecret Proxy Config
 fs_proxy_index = 0

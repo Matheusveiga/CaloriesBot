@@ -24,10 +24,13 @@ def log_calories(user_id: str, user_name: str, items: list):
                 entry["embedding"] = item.get("embedding")
             prepared_data.append(entry)
         if prepared_data:
-            supabase.table("logs").insert(prepared_data).execute()
+            res = supabase.table("logs").insert(prepared_data).execute()
+            if hasattr(res, 'error') and res.error:
+                logger.error(f"Erro Supabase (Insert): {res.error}")
+                return False
         return True
     except Exception as e:
-        logger.error(f"Erro ao salvar no Supabase: {e}")
+        logger.error(f"Erro ao salvar no Supabase (Exception): {e}")
         return False
 
 def save_to_universal_catalog(item: dict):
@@ -57,11 +60,14 @@ def save_to_universal_catalog(item: dict):
             "is_precise": item.get("is_precise", True)
         }
         
-        supabase.table("universal_catalog").insert(data).execute()
+        res = supabase.table("universal_catalog").insert(data).execute()
+        if hasattr(res, 'error') and res.error:
+            logger.error(f"Erro Supabase (Universal Insert): {res.error}")
+            return False
         logger.info(f"✅ Item '{food_name}' salvo no NOVO Catálogo Universal.")
         return True
     except Exception as e:
-        logger.error(f"Erro ao salvar no catálogo universal: {e}")
+        logger.error(f"Erro ao salvar no catálogo universal (Exception): {e}")
         return False
 
 def search_universal_catalog(query_embedding: list, threshold: float = 0.8):
@@ -74,18 +80,18 @@ def search_universal_catalog(query_embedding: list, threshold: float = 0.8):
             "match_count": 1
         }).execute()
         
-        if res.data:
+        if res and hasattr(res, 'data') and res.data:
             item = res.data[0]
             return [{
-                "alimento": item["food"],
-                "peso": item["serving_size"],
-                "calorias": item["kcal"],
-                "proteina": item["protein"],
-                "carboidratos": item["carbs"],
-                "gorduras": item["fat"],
+                "alimento": item.get("food", "Desconhecido"),
+                "peso": item.get("serving_size", "100g"),
+                "calorias": item.get("kcal", 0),
+                "proteina": item.get("protein", 0),
+                "carboidratos": item.get("carbs", 0),
+                "gorduras": item.get("fat", 0),
                 "is_precise": True,
                 "is_universal": True,
-                "similarity": item["similarity"]
+                "similarity": item.get("similarity", 0)
             }]
         return None
     except Exception as e:
@@ -135,12 +141,15 @@ def get_report_data(user_id: str, days: int):
     try:
         now_br = get_br_now()
         start_date = (now_br - timedelta(days=days)).strftime("%Y-%m-%dT00:00:00-03:00")
-        response = supabase.table("logs") \
+        res = supabase.table("logs") \
             .select("created_at, kcal") \
             .eq("user_id", str(user_id)) \
             .gte("created_at", start_date) \
             .execute()
-        return response.data
+        if hasattr(res, 'error') and res.error:
+            logger.error(f"Erro Supabase (Report): {res.error}")
+            return []
+        return res.data or []
     except Exception as e:
         logger.error(f"Erro ao buscar dados do relatório: {e}")
         return []
@@ -224,9 +233,9 @@ def search_food_history(user_id: str, food_query: str):
                 .execute()
             if res.data: res.data[0]["is_approximate"] = True
 
-        # Catálogo Universal
+        # Catálogo Universal (Fallback se não achar no pessoal)
         is_universal = False
-        if not res.data:
+        if not res or not res.data:
             res = supabase.table("logs") \
                 .select("food, weight, kcal, protein, carbs, fat, meal_type, is_precise, confirmations") \
                 .ilike("food", f"{food_query}") \
@@ -234,20 +243,20 @@ def search_food_history(user_id: str, food_query: str):
                 .order("created_at", desc=True) \
                 .limit(1) \
                 .execute()
-            if res.data:
+            if res and res.data:
                 is_universal = True
                 logger.info(f"Item encontrado no Catálogo Universal: {food_query}")
 
-        if res.data:
+        if res and hasattr(res, 'data') and res.data:
             item = res.data[0]
             return [{
-                "alimento": item["food"],
-                "peso": item["weight"],
-                "calorias": item["kcal"],
-                "proteina": item["protein"],
-                "carboidratos": item["carbs"],
-                "gorduras": item["fat"],
-                "refeicao": item["meal_type"],
+                "alimento": item.get("food", food_query),
+                "peso": item.get("weight", "100g"),
+                "calorias": item.get("kcal", 0),
+                "proteina": item.get("protein", 0),
+                "carboidratos": item.get("carbs", 0),
+                "gorduras": item.get("fat", 0),
+                "refeicao": item.get("meal_type", "Outro"),
                 "is_precise": item.get("is_precise", False),
                 "is_approximate": item.get("is_approximate", False),
                 "is_universal": is_universal

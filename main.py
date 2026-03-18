@@ -17,7 +17,7 @@ from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, StateFilter
 from aiogram.types import Update, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.base import BaseStorage, StorageKey, StateType
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from google import genai
@@ -45,7 +45,6 @@ WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL")
 
 # Init Clients
 bot = Bot(token=TELEGRAM_TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
 app = FastAPI()
 ai_client = genai.Client(api_key=GEMINI_KEY)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -87,6 +86,9 @@ class BarcodeState(StatesGroup):
 
 class CorrectionStates(StatesGroup):
     kcal = State()
+
+class FatSecretState(StatesGroup):
+    waiting_for_choice = State()
 
 # Global State
 processed_messages = set()
@@ -161,8 +163,9 @@ async def generate_sarcastic_response(user_id: int, message_text: str):
 # --- Timezone Helpers ---
 
 def get_br_now():
-    """Returns the current datetime in Brazil (UTC-3)."""
-    return datetime.utcnow() - timedelta(hours=3)
+    """Returns the current datetime in Brazil (America/Sao_Paulo)."""
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo("America/Sao_Paulo"))
 
 def get_br_today_start():
     """Returns the start of today in Brazil (00:00:00) in ISO format with offset."""
@@ -180,7 +183,58 @@ def parse_numeric(text: str) -> Optional[float]:
 
 # --- DB Logic ---
 
-def log_calories(user_id: str, user_name: str, items: list):
+async def async_execute(query):
+    import asyncio
+    return await asyncio.to_thread(query.execute)
+
+class SupabaseStorage(BaseStorage):
+    def __init__(self, client):
+        self.client = client
+
+    async def set_state(self, key: StorageKey, state: StateType = None) -> None:
+        state_str = state.state if hasattr(state, 'state') else state if state else None
+        payload = {
+            "bot_id": key.bot_id,
+            "chat_id": key.chat_id,
+            "user_id": key.user_id,
+            "destiny": key.destiny,
+            "state": state_str
+        }
+        await async_execute(self.client.table("fsm_data").upsert(
+            payload, on_conflict="bot_id,chat_id,user_id,destiny"
+        ))
+
+    async def get_state(self, key: StorageKey) -> Optional[str]:
+        res = await async_execute(self.client.table("fsm_data").select("state").eq("bot_id", key.bot_id).eq("chat_id", key.chat_id).eq("user_id", key.user_id).eq("destiny", key.destiny))
+        if res.data and len(res.data) > 0:
+            return res.data[0].get("state")
+        return None
+
+    async def set_data(self, key: StorageKey, data: Dict[str, Any]) -> None:
+        payload = {
+            "bot_id": key.bot_id,
+            "chat_id": key.chat_id,
+            "user_id": key.user_id,
+            "destiny": key.destiny,
+            "data": data
+        }
+        await async_execute(self.client.table("fsm_data").upsert(
+            payload, on_conflict="bot_id,chat_id,user_id,destiny"
+        ))
+
+    async def get_data(self, key: StorageKey) -> Dict[str, Any]:
+        res = await async_execute(self.client.table("fsm_data").select("data").eq("bot_id", key.bot_id).eq("chat_id", key.chat_id).eq("user_id", key.user_id).eq("destiny", key.destiny))
+        if res.data and len(res.data) > 0:
+            return res.data[0].get("data") or {}
+        return {}
+
+    async def close(self) -> None:
+        pass
+
+# Initialize Dispatcher here because it needs SupabaseStorage and supabase client
+dp = Dispatcher(storage=SupabaseStorage(supabase))
+
+async def log_calories(user_id: str, user_name: str, items: list):
     """Saves a list of food items to the database including macros."""
     try:
         prepared_data = []
@@ -202,14 +256,14 @@ def log_calories(user_id: str, user_name: str, items: list):
                 entry["embedding"] = item.get("embedding")
             prepared_data.append(entry)
         if prepared_data:
-            res = supabase.table("logs").insert(prepared_data).execute()
+            res = await async_execute(supabase.table("logs").insert(prepared_data))
             logger.info(f"Supabase Log Insertion Result: {res.data}")
         return True
     except Exception as e:
         logger.error(f"Erro ao salvar no Supabase: {e}")
         return False
 
-def save_to_universal_catalog(item: dict):
+async def save_to_universal_catalog(item: dict):
     """Saves a verified food item to the catalog to prevent redundant AI calls."""
     try:
         food_name = item.get("alimento")
@@ -228,7 +282,7 @@ def save_to_universal_catalog(item: dict):
             "confirmations": int(item.get("confirmations", 1)),
             "is_precise": bool(item.get("is_precise", True))
         }
-        res = supabase.table("universal_catalog").insert(data).execute()
+        res = await async_execute(supabase.table("universal_catalog").insert(data))
         logger.info(f"Supabase Catalog Insertion Result: {res.data}")
         logger.info(f"✅ Item '{food_name}' salvo no Catálogo Universal.")
         return True
@@ -236,14 +290,14 @@ def save_to_universal_catalog(item: dict):
         logger.error(f"Erro ao salvar no catálogo: {e}")
         return False
 
-def search_universal_catalog(query_embedding: list, threshold: float = 0.85):
+async def search_universal_catalog(query_embedding: list, threshold: float = 0.85):
     """Performs semantic search in the universal_catalog table."""
     try:
-        res = supabase.rpc("match_food_catalog", {
+        res = await async_execute(supabase.rpc("match_food_catalog", {
             "query_embedding": query_embedding,
             "match_threshold": threshold,
             "match_count": 1
-        }).execute()
+        }))
         logger.info(f"Supabase Vector Search result: {res.data}")
         
         if res.data:
@@ -263,23 +317,24 @@ def search_universal_catalog(query_embedding: list, threshold: float = 0.85):
         logger.error(f"Erro na busca vetorial: {e}")
         return None
 
-def get_user_profile(user_id: str):
+async def get_user_profile(user_id: str):
     try:
-        res = supabase.table("profiles").select("*").eq("user_id", str(user_id)).execute()
+        res = await async_execute(supabase.table("profiles").select("*").eq("user_id", str(user_id)))
         return res.data[0] if res.data else None
     except Exception as e:
         logger.error(f"Erro ao buscar perfil: {e}")
         return None
 
-def get_daily_stats(user_id: str):
+async def get_daily_stats(user_id: str):
     """Calculates total calories and macros for the current day."""
     try:
         today_br_start = get_br_today_start()
-        response = supabase.table("logs") \
-            .select("kcal, protein, carbs, fat") \
-            .eq("user_id", str(user_id)) \
-            .gte("created_at", today_br_start) \
-            .execute()
+        response = await async_execute(
+            supabase.table("logs")
+            .select("kcal, protein, carbs, fat")
+            .eq("user_id", str(user_id))
+            .gte("created_at", today_br_start)
+        )
             
         total_kcal = sum(item.get('kcal', 0) for item in response.data)
         total_prot = sum(item.get('protein', 0) for item in response.data)
@@ -296,89 +351,96 @@ def get_daily_stats(user_id: str):
         logger.error(f"Erro ao calcular estatísticas diárias: {e}")
         return {"kcal": 0, "protein": 0, "carbs": 0, "fat": 0}
 
-def get_daily_total(user_id: str):
-    return get_daily_stats(user_id)["kcal"]
+async def get_daily_total(user_id: str):
+    stats = await get_daily_stats(user_id)
+    return stats["kcal"]
 
-def get_report_data(user_id: str, days: int):
+async def get_report_data(user_id: str, days: int):
     """Aggregates data for periodic reports."""
     try:
         now_br = get_br_now()
         start_date = (now_br - timedelta(days=days)).strftime("%Y-%m-%dT00:00:00-03:00")
-        res = supabase.table("logs") \
-            .select("created_at, kcal, protein, carbs, fat") \
-            .eq("user_id", str(user_id)) \
-            .gte("created_at", start_date) \
-            .execute()
+        res = await async_execute(
+            supabase.table("logs")
+            .select("created_at, kcal, protein, carbs, fat")
+            .eq("user_id", str(user_id))
+            .gte("created_at", start_date)
+        )
         return res.data or []
     except Exception as e:
         logger.error(f"Erro ao buscar dados do relatório: {e}")
         return []
 
-def delete_last_log(user_id: str):
+async def delete_last_log(user_id: str):
     """Deletes the most recent meal log."""
     try:
-        res = supabase.table("logs") \
-            .select("id, created_at") \
-            .eq("user_id", str(user_id)) \
-            .order("created_at", desc=True) \
-            .limit(1) \
-            .execute()
+        res = await async_execute(
+            supabase.table("logs")
+            .select("id, created_at")
+            .eq("user_id", str(user_id))
+            .order("created_at", desc=True)
+            .limit(1)
+        )
         if res.data:
             created_at = res.data[0]['created_at']
-            supabase.table("logs").delete() \
-                .eq("user_id", str(user_id)) \
-                .eq("created_at", created_at) \
-                .execute()
+            await async_execute(
+                supabase.table("logs").delete()
+                .eq("user_id", str(user_id))
+                .eq("created_at", created_at)
+            )
             return True
         return False
     except Exception as e:
         logger.error(f"Erro ao deletar último log: {e}")
         return False
 
-def delete_today_logs(user_id: str):
+async def delete_today_logs(user_id: str):
     """Deletes all logs from the current day."""
     try:
         today_br_start = get_br_today_start()
-        supabase.table("logs").delete() \
-            .eq("user_id", str(user_id)) \
-            .gte("created_at", today_br_start) \
-            .execute()
+        await async_execute(
+            supabase.table("logs").delete()
+            .eq("user_id", str(user_id))
+            .gte("created_at", today_br_start)
+        )
         return True
     except Exception as e:
         logger.error(f"Erro ao deletar logs de hoje: {e}")
         return False
 
-def delete_entire_profile(user_id: str):
+async def delete_entire_profile(user_id: str):
     """Deletes profile and all logs for a user."""
     try:
-        supabase.table("logs").delete().eq("user_id", str(user_id)).execute()
-        supabase.table("profiles").delete().eq("user_id", str(user_id)).execute()
+        await async_execute(supabase.table("logs").delete().eq("user_id", str(user_id)))
+        await async_execute(supabase.table("profiles").delete().eq("user_id", str(user_id)))
         return True
     except Exception as e:
         logger.error(f"Erro ao deletar perfil completo: {e}")
         return False
 
-def search_food_history(user_id: str, food_query: str):
+async def search_food_history(user_id: str, food_query: str):
     """Searches for a historical log entry (Personal -> Universal Fallback)."""
     try:
         # Pessoal Exato
-        res = supabase.table("logs") \
-            .select("food, weight, kcal, protein, carbs, fat, meal_type, is_precise") \
-            .eq("user_id", str(user_id)) \
-            .ilike("food", f"{food_query}") \
-            .order("created_at", desc=True) \
-            .limit(1) \
-            .execute()
+        res = await async_execute(
+            supabase.table("logs")
+            .select("food, weight, kcal, protein, carbs, fat, meal_type, is_precise")
+            .eq("user_id", str(user_id))
+            .ilike("food", f"{food_query}")
+            .order("created_at", desc=True)
+            .limit(1)
+        )
         
         # Pessoal Aproximado
         if not res.data:
-            res = supabase.table("logs") \
-                .select("food, weight, kcal, protein, carbs, fat, meal_type, is_precise") \
-                .eq("user_id", str(user_id)) \
-                .ilike("food", f"%{food_query}%") \
-                .order("created_at", desc=True) \
-                .limit(1) \
-                .execute()
+            res = await async_execute(
+                supabase.table("logs")
+                .select("food, weight, kcal, protein, carbs, fat, meal_type, is_precise")
+                .eq("user_id", str(user_id))
+                .ilike("food", f"%{food_query}%")
+                .order("created_at", desc=True)
+                .limit(1)
+            )
             if res.data: res.data[0]["is_approximate"] = True
 
         if res and res.data:
@@ -507,68 +569,70 @@ async def search_fatsecret(food_name: str):
             logger.info(f"FatSecret Searching with '{search_term}' ({search_key}). Results: {len(foods_data)}")
 
             selection_prompt = f"""
-            Qual desses alimentos é o MELHOR match para o pedido original: "{queries.get('pt')}"?
+            Quais desses alimentos são os MELHORES matches para o pedido original: "{queries.get('pt')}"?
             
             REGRAS RÍGIDAS:
-            1. Se nenhum alimento for do MESMO TIPO/CATEGORIA (ex: pão deve ser pão, carne deve ser carne), retorne -1.
-            2. Não aceite ham (presunto) se o pedido for bread (pão).
-            3. Priorize o primeiro que fizer sentido.
+            1. Retorne APENAS um JSON com a lista dos índices aceitáveis em ordem de relevância (máx 3).
+            2. Se nenhum alimento for do MESMO TIPO (ex: pão deve ser pão, carne deve ser carne), retorne lista vazia [].
+            3. Priorize alimentos genéricos e evite marcas desconhecidas a menos que especificado.
             
             RESULTADOS: {json.dumps([{"name": f['food_name'], "desc": f['food_description']} for f in foods_data], ensure_ascii=False)}
             
-            Retorne APENAS o índice (0, 1, 2...) ou -1.
+            SCHEMA OBRIGATÓRIO: {{"indices": [0, 1]}}
             """
             
-            # 3. Alterado para o modelo 70B. Ele respeita muito melhor a regra do -1.
             sel_res = await groq_client.chat.completions.create(
                 messages=[{"role": "user", "content": selection_prompt}],
                 model="llama-3.3-70b-versatile",
+                response_format={"type": "json_object"},
                 temperature=0,
             )
             
             try:
-                raw_idx = sel_res.choices[0].message.content.strip()
-                idx = int(re.sub(r'[^0-9-]', '', raw_idx))
-                if idx < 0 or idx >= len(foods_data):
+                raw_json = sel_res.choices[0].message.content.strip()
+                parsed = json.loads(raw_json)
+                indices = parsed.get("indices", [])
+                
+                valid_indices = [idx for idx in indices if isinstance(idx, int) and 0 <= idx < len(foods_data)]
+                if not valid_indices:
                     logger.warning(f"Selection rejected for '{search_term}'. Trying next term...")
                     continue
                 
-                best_food = foods_data[idx]
-                logger.info(f"🎯 FatSecret Selected: {best_food['food_name']}")
-                
-                # Fetch details - SEM region e language
-                food_id = best_food["food_id"]
-                d_res = await client.get(url, params={"method": "food.get.v2", "food_id": food_id, "format": "json"}, headers=headers)
-                
-                if d_res.status_code == 200:
-                    d_data = d_res.json()
-                    logger.info(f"FatSecret Raw Detail Result: {json.dumps(d_data, ensure_ascii=False)}")
+                results = []
+                for idx in valid_indices[:3]:
+                    best_food = foods_data[idx]
+                    logger.info(f"🎯 FatSecret Selected Candidate: {best_food['food_name']}")
                     
-                    d = d_data.get("food", {})
-                    servings = d.get("servings", {}).get("serving", [])
-                    if isinstance(servings, dict): servings = [servings]
-                    if not servings: continue
-                    s = servings[0]
+                    # Fetch details - SEM region e language
+                    food_id = best_food["food_id"]
+                    d_res = await client.get(url, params={"method": "food.get.v2", "food_id": food_id, "format": "json"}, headers=headers)
                     
-                    # Get the most accurate serving weight
-                    serving_qty = s.get("metric_serving_amount")
-                    serving_unit = s.get("metric_serving_unit", "g")
-                    weight_str = f"{float(serving_qty):.1f}{serving_unit}" if serving_qty else "100g"
-                    
-                    result = {
-                        "alimento": queries.get('pt') or food_name, # Salva com o nome original em PT!
-                        "calorias": float(s.get("calories", 0)),
-                        "proteina": float(s.get("protein", 0)),
-                        "carboidratos": float(s.get("carbohydrate", 0)),
-                        "gorduras": float(s.get("fat", 0)),
-                        "peso": weight_str,
-                        "is_precise": True
-                    }
-                    # Save to catalog logic
-                    emb = await get_embedding(result["alimento"])
-                    result["embedding"] = emb
-                    save_to_universal_catalog(result)
-                    return [result]
+                    if d_res.status_code == 200:
+                        d_data = d_res.json()
+                        d = d_data.get("food", {})
+                        servings = d.get("servings", {}).get("serving", [])
+                        if isinstance(servings, dict): servings = [servings]
+                        if not servings: continue
+                        s = servings[0]
+                        
+                        serving_qty = s.get("metric_serving_amount")
+                        serving_unit = s.get("metric_serving_unit", "g")
+                        weight_str = f"{float(serving_qty):.1f}{serving_unit}" if serving_qty else "100g"
+                        
+                        result = {
+                            "alimento": best_food['food_name'],
+                            "calorias": float(s.get("calories", 0)),
+                            "proteina": float(s.get("protein", 0)),
+                            "carboidratos": float(s.get("carbohydrate", 0)),
+                            "gorduras": float(s.get("fat", 0)),
+                            "peso": weight_str,
+                            "is_precise": True,
+                            "original_query": queries.get('pt') or food_name,
+                            "is_fs_verified": True
+                        }
+                        results.append(result)
+                if results:
+                    return results
             except Exception as e:
                 logger.error(f"Error in FatSecret selection/detail: {e}")
                 continue
@@ -578,26 +642,38 @@ async def search_fatsecret(food_name: str):
             if client is not http_client: await client.aclose()
     return None
 
-async def extract_calories_list(user_id: int, message_text: str = "", image_bytes: bytes = None):
+async def extract_calories_list(user_id: int, message_text: str = "", image_bytes: bytes = None, fs_chosen_candidate: dict = None):
     # Flow: 1. Search (Catalog + FatSecret) -> 2. Contextual Extraction (Groq/Gemini scales everything)
     
     search_context = []
     
-    # 1. Search Catalog (Vector)
-    if message_text and not image_bytes:
-        emb = await get_embedding(message_text)
-        if emb:
-            match = search_universal_catalog(emb)
-            if match:
-                logger.info(f"🎯 Catalog Context Hit: {message_text}")
-                search_context.extend(match)
+    if fs_chosen_candidate:
+        search_context.append(fs_chosen_candidate)
+    else:
+        # 1. Search Catalog (Vector)
+        if message_text and not image_bytes:
+            emb = await get_embedding(message_text)
+            if emb:
+                match = await search_universal_catalog(emb)
+                if match:
+                    logger.info(f"🎯 Catalog Context Hit: {message_text}")
+                    search_context.extend(match)
 
-    # 2. Search FatSecret (Text only fallback)
-    if not image_bytes and message_text:
-        fs_res = await search_fatsecret(message_text)
-        if fs_res:
-            logger.info(f"🔍 FatSecret Context Hit for: {message_text}")
-            search_context.extend(fs_res)
+        # 2. Search FatSecret (Text only fallback)
+        if not image_bytes and message_text and not search_context:
+            fs_res = await search_fatsecret(message_text)
+            if fs_res:
+                if len(fs_res) > 1:
+                    logger.info("Multiple FatSecret candidates found. Requesting user choice.")
+                    return [], None, "needs_choice", json.dumps({"candidates": fs_res})
+                elif len(fs_res) == 1:
+                    cand = fs_res[0]
+                    logger.info(f"🔍 FatSecret Single Context Hit: {cand['alimento']}")
+                    cand["alimento"] = cand.get("original_query", cand["alimento"])
+                    emb = await get_embedding(cand["alimento"])
+                    cand["embedding"] = emb
+                    await save_to_universal_catalog(cand)
+                    search_context.append(cand)
 
     # 3. Model extraction with Context
     if image_bytes:
@@ -762,7 +838,7 @@ async def get_barcode_data(barcode: str):
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     logger.info(f"User {message.from_user.id} enviou /start")
-    profile = get_user_profile(message.from_user.id)
+    profile = await get_user_profile(message.from_user.id)
     
     if not profile:
         await message.answer(
@@ -771,7 +847,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
             "precisamos configurar seu perfil (é rapidinho).",
             parse_mode="Markdown"
         )
-        await message.answer("1️⃣ Qual seu **peso** atual em kg? (ex: 75.5)")
+        await message.answer("1️⃣ Qual seu **peso** atual em kg? (ex: 75.5)", parse_mode="Markdown")
         await state.set_state(ProfileStates.weight)
     else:
         await message.answer(
@@ -802,7 +878,7 @@ async def cmd_help(message: types.Message):
 
 @dp.message(Command("desfazer"))
 async def cmd_undo(message: types.Message):
-    if delete_last_log(message.from_user.id):
+    if await delete_last_log(message.from_user.id):
         # Remove a última entrada da memória da IA também para manter coerência
         if message.from_user.id in user_history and user_history[message.from_user.id]:
             user_history[message.from_user.id].pop()
@@ -812,25 +888,22 @@ async def cmd_undo(message: types.Message):
 
 @dp.message(Command("reset_dia"))
 async def cmd_reset_day(message: types.Message):
-    if delete_today_logs(message.from_user.id):
-        # Limpa memória local da IA também para o dia
+    if await delete_today_logs(message.from_user.id):
         if message.from_user.id in user_history:
             user_history[message.from_user.id] = []
-        await message.answer("📅 Seus logs de **hoje** foram apagados!")
+        await message.answer("📅 Seus logs de **hoje** foram apagados!", parse_mode="Markdown")
     else:
         await message.answer("❌ Erro ao apagar logs de hoje.")
 
 @dp.message(Command("reset_perfil"))
 async def cmd_reset_profile(message: types.Message, state: FSMContext):
-    if delete_entire_profile(message.from_user.id):
-        # Limpa tudo
+    if await delete_entire_profile(message.from_user.id):
         if message.from_user.id in user_history:
             del user_history[message.from_user.id]
         if message.from_user.id in jailbreak_users:
             del jailbreak_users[message.from_user.id]
             
-        await message.answer("💥 **Perfil e histórico deletados!** Vamos começar do zero.")
-        # Trigger onboarding again
+        await message.answer("💥 **Perfil e histórico deletados!** Vamos começar do zero.", parse_mode="Markdown")
         await cmd_start(message, state)
     else:
         await message.answer("❌ Erro ao deletar seu perfil.")
@@ -838,14 +911,14 @@ async def cmd_reset_profile(message: types.Message, state: FSMContext):
 @dp.message(Command("status"))
 async def cmd_status(message: types.Message):
     user_id = message.from_user.id
-    profile = get_user_profile(user_id)
+    profile = await get_user_profile(user_id)
     
     if not profile:
         await message.answer("⚠️ Você ainda não configurou seu perfil. Use /start para começar!")
         return
         
     daily_limit = profile['tdee']
-    daily_total = get_daily_total(user_id)
+    daily_total = await get_daily_total(user_id)
     remaining = daily_limit - daily_total
     
     # Get current meal data for macros breakdown
@@ -853,7 +926,7 @@ async def cmd_status(message: types.Message):
     now_br = get_br_now()
     data_formatada = now_br.strftime("%d/%m/%Y %H:%M")
     
-    res = supabase.table("logs").select("protein, carbs, fat").eq("user_id", str(user_id)).gte("created_at", today_br_start).execute()
+    res = await async_execute(supabase.table("logs").select("protein, carbs, fat").eq("user_id", str(user_id)).gte("created_at", today_br_start))
     total_prot = sum(item.get('protein', 0) for item in res.data)
     total_carb = sum(item.get('carbs', 0) for item in res.data)
     total_fat = sum(item.get('fat', 0) for item in res.data)
@@ -891,12 +964,13 @@ async def process_adjustment(callback: types.CallbackQuery):
     
     try:
         # Get the latest entry timestamp for this user
-        res = supabase.table("logs") \
-            .select("created_at") \
-            .eq("user_id", str(user_id)) \
-            .order("created_at", desc=True) \
-            .limit(1) \
-            .execute()
+        res = await async_execute(
+        supabase.table("logs")
+        .select("created_at")
+        .eq("user_id", str(user_id))
+        .order("created_at", desc=True)
+        .limit(1)
+    )
         
         if not res.data:
             await callback.answer("❌ Nenhum log recente encontrado.")
@@ -905,7 +979,7 @@ async def process_adjustment(callback: types.CallbackQuery):
         last_time = res.data[0]['created_at']
 
         if action == "undo":
-            if delete_last_log(user_id):
+            if await delete_last_log(user_id):
                 await callback.message.edit_text("🔄 **Log desfeito com sucesso!**", parse_mode="Markdown")
             else:
                 await callback.answer("❌ Erro ao desfazer.")
@@ -916,19 +990,22 @@ async def process_adjustment(callback: types.CallbackQuery):
         
         # Update kcal and macros in the DB using RPC or direct update
         # For simplicity, we update all entries at that exact timestamp
-        logs_to_update = supabase.table("logs") \
-            .select("*") \
-            .eq("user_id", str(user_id)) \
-            .eq("created_at", last_time) \
-            .execute()
+        logs_to_update = await async_execute(
+        supabase.table("logs")
+        .select("*")
+        .eq("user_id", str(user_id))
+        .eq("created_at", last_time)
+    )
 
         for entry in logs_to_update.data:
-            supabase.table("logs").update({
-                "kcal": round(entry['kcal'] * multiplier),
-                "protein": round(entry['protein'] * multiplier),
-                "carbs": round(entry['carbs'] * multiplier),
-                "fat": round(entry['fat'] * multiplier)
-            }).eq("id", entry['id']).execute()
+            await async_execute(
+        supabase.table("logs").update({
+            "kcal": round(entry['kcal'] * multiplier),
+            "protein": round(entry['protein'] * multiplier),
+            "carbs": round(entry['carbs'] * multiplier),
+            "fat": round(entry['fat'] * multiplier)
+        }).eq("id", entry['id'])
+    )
 
         pct = "+10%" if multiplier > 1 else "-10%"
         await callback.message.edit_text(f"✅ Ajustado em **{pct}**! Use /status para ver o novo total.", parse_mode="Markdown")
@@ -955,24 +1032,27 @@ async def process_manual_kcal(message: types.Message, state: FSMContext):
         
     user_id = message.from_user.id
     # Get the latest entry to correct
-    res = supabase.table("logs") \
-        .select("*") \
-        .eq("user_id", str(user_id)) \
-        .order("created_at", desc=True) \
-        .limit(1) \
-        .execute()
+    res = await async_execute(
+        supabase.table("logs")
+        .select("*")
+        .eq("user_id", str(user_id))
+        .order("created_at", desc=True)
+        .limit(1)
+    )
         
     if res.data:
         entry = res.data[0]
         weight = extract_amount(entry.get("weight", "100g")) or 100
         new_kcal = round((kcal_100g / 100) * weight)
         
+        await async_execute(
         supabase.table("logs").update({
             "kcal": new_kcal,
             "is_precise": True
-        }).eq("id", entry['id']).execute()
+        }).eq("id", entry['id'])
+    )
         
-        await message.answer(f"✅ Corrigido para **{new_kcal} kcal** ({kcal_100g} kcal/100g)!")
+        await message.answer(f"✅ Corrigido para **{new_kcal} kcal** ({kcal_100g} kcal/100g)!", parse_mode="Markdown")
     
     await state.clear()
 
@@ -985,7 +1065,7 @@ async def cmd_cancel(message: types.Message, state: FSMContext):
 
 @dp.message(Command("perfil"))
 async def start_profile(message: types.Message, state: FSMContext):
-    await message.answer("Vamos calcular sua meta! Qual seu **peso** atual em kg? (ex: 75.5)")
+    await message.answer("Vamos calcular sua meta! Qual seu **peso** atual em kg? (ex: 75.5)", parse_mode="Markdown")
     await state.set_state(ProfileStates.weight)
 
 @dp.message(ProfileStates.weight)
@@ -993,7 +1073,7 @@ async def process_weight(message: types.Message, state: FSMContext):
     try:
         weight = float(message.text.replace(',', '.'))
         await state.update_data(weight=weight)
-        await message.answer("2️⃣ Qual sua **altura** em cm? (ex: 175)")
+        await message.answer("2️⃣ Qual sua **altura** em cm? (ex: 175)", parse_mode="Markdown")
         await state.set_state(ProfileStates.height)
     except:
         await message.answer("Por favor, envie um número válido.")
@@ -1003,7 +1083,7 @@ async def process_height(message: types.Message, state: FSMContext):
     try:
         height = float(message.text)
         await state.update_data(height=height)
-        await message.answer("3️⃣ Qual sua **idade**?")
+        await message.answer("3️⃣ Qual sua **idade**?", parse_mode="Markdown")
         await state.set_state(ProfileStates.age)
     except:
         await message.answer("Por favor, envie um número válido.")
@@ -1017,7 +1097,7 @@ async def process_age(message: types.Message, state: FSMContext):
             [InlineKeyboardButton(text="Masculino", callback_data="g_M"), 
              InlineKeyboardButton(text="Feminino", callback_data="g_F")]
         ])
-        await message.answer("4️⃣ Qual seu **sexo**?", reply_markup=kb)
+        await message.answer("4️⃣ Qual seu **sexo**?", reply_markup=kb, parse_mode="Markdown")
         await state.set_state(ProfileStates.gender)
     except:
         await message.answer("Por favor, envie um número válido.")
@@ -1033,7 +1113,7 @@ async def process_gender(callback: types.CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="Ativo (6-7 dias/sem)", callback_data="act_ativo")],
         [InlineKeyboardButton(text="Atleta (2x dia)", callback_data="act_atleta")]
     ])
-    await callback.message.edit_text("5️⃣ Qual seu nível de **atividade física**?", reply_markup=kb)
+    await callback.message.edit_text("5️⃣ Qual seu nível de **atividade física**?", reply_markup=kb, parse_mode="Markdown")
     await state.set_state(ProfileStates.activity)
 
 @dp.callback_query(ProfileStates.activity, F.data.startswith("act_"))
@@ -1046,7 +1126,7 @@ async def process_activity(callback: types.CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="Manter Peso", callback_data="goal_manter")],
         [InlineKeyboardButton(text="Ganhar Massa", callback_data="goal_ganhar")]
     ])
-    await callback.message.edit_text("6️⃣ Qual seu **objetivo** principal?", reply_markup=kb)
+    await callback.message.edit_text("6️⃣ Qual seu **objetivo** principal?", reply_markup=kb, parse_mode="Markdown")
     await state.set_state(ProfileStates.goal)
 
 @dp.callback_query(ProfileStates.goal, F.data.startswith("goal_"))
@@ -1067,13 +1147,14 @@ async def process_goal(callback: types.CallbackQuery, state: FSMContext):
         "goal": goal,
         "tdee": float(tdee)
     }
-    supabase.table("profiles").upsert(profile_data).execute()
+    await async_execute(supabase.table("profiles").upsert(profile_data))
     
     await state.clear()
     await callback.message.edit_text(
         f"✅ Perfil configurado!\n"
         f"Sua meta diária (ajustada para {goal}) é: **{tdee} kcal**\n\n"
-        f"Agora é só me mandar seus alimentos ou uma foto do prato! 📸🍎"
+        f"Agora é só me mandar seus alimentos ou uma foto do prato! 📸🍎",
+        parse_mode="Markdown"
     )
 
 @dp.message(BarcodeState.waiting_for_portion)
@@ -1158,8 +1239,8 @@ def generate_report_chart(data: list, days: int):
 async def process_report(callback: types.CallbackQuery):
     try:
         days = int(callback.data.split("_")[1])
-        data = get_report_data(callback.from_user.id, days)
-        profile = get_user_profile(callback.from_user.id)
+        data = await get_report_data(callback.from_user.id, days)
+        profile = await get_user_profile(callback.from_user.id)
         
         tdee = profile['tdee'] if profile else 2000
         total_kcal = sum(d.get('kcal', 0) for d in data)
@@ -1211,28 +1292,35 @@ async def process_food_entry(message: types.Message, items: list, raw_data: str)
         return
 
     # Log to DB
-    if not log_calories(message.from_user.id, message.from_user.full_name, items):
+    if not await log_calories(message.from_user.id, message.from_user.full_name, items):
         await message.answer("❌ Erro ao salvar dados no Supabase.")
         return
     
-    stats = get_daily_stats(message.from_user.id)
-    profile = get_user_profile(message.from_user.id)
+    stats = await get_daily_stats(message.from_user.id)
+    profile = await get_user_profile(message.from_user.id)
     daily_limit = profile['tdee'] if profile else 2000
     daily_total = stats["kcal"]
     remaining = daily_limit - daily_total
     
+    has_universal = any(i.get("is_universal") for i in items)
+    has_fs = any(i.get("is_fs_verified") for i in items)
+    
+    source_tag = ""
+    if has_universal:
+        source_tag = "✅ `DADO VERIFICADO (Catálogo)`\n\n"
+    elif has_fs or all(i.get("is_precise") for i in items):
+        source_tag = "✅ `DADO VERIFICADO (FatSecret/Scanner)`\n\n"
+    else:
+        source_tag = "⚠️ `DADO ESTIMADO (IA)`\n\n"
+
     items_text = ""
     for idx, i in enumerate(items):
         emoji = "🍎" if idx % 2 == 0 else "🥩"
         meal = f"[{i.get('refeicao', 'Outro')}] "
-        # Se for preciso (Verificado), não mostra tag. Se for impreciso, mostra (estimado).
         precisao = "" if i.get("is_precise", False) else " ⚠️ *(estimado)*"
         
-        # Tag especial para Catálogo Universal
-        universal_tag = " 🌐 *(universal)*" if i.get("is_universal") else ""
-        
-        items_text += f"{emoji} {meal}**{i['alimento']}** ({i['peso']}) → {i['calorias']} kcal{precisao}{universal_tag}\n"
-        items_text += f"   └ P: {i.get('proteina', 0)}g | C: {i.get('carboidratos', 0)}g | G: {i.get('gorduras', 0)}g\n"
+        items_text += f"{emoji} {meal}**{i['alimento']}** (**{i['peso']}**) → **{i['calorias']} kcal**{precisao}\n"
+        items_text += f"   └ P: **{i.get('proteina', 0)}g** | C: **{i.get('carboidratos', 0)}g** | G: **{i.get('gorduras', 0)}g**\n"
         
     progress_val = min(10, round((daily_total/daily_limit)*10)) if daily_limit > 0 else 0
     progress_bar = "🔵" * progress_val + "⚪" * (10 - progress_val)
@@ -1249,10 +1337,11 @@ async def process_food_entry(message: types.Message, items: list, raw_data: str)
     ])
 
     response_text = (
+        f"{source_tag}"
         f"{items_text}\n"
-        f"📊 **CONTAGEM DE HOJE ({data_formatada})**\n"
+        f"📊 **RELATÓRIO DE HOJE ({data_formatada})**\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"🔥 Soma: **{daily_total}** / {daily_limit} kcal\n"
+        f"🔥 Soma: **{daily_total}** / **{daily_limit} kcal**\n"
         f"⚖️ Restante: **{max(0, remaining)} kcal**\n\n"
         f"{progress_bar}"
     )
@@ -1301,8 +1390,8 @@ async def handle_photo(message: types.Message, state: FSMContext):
         await message.answer("❌ Ocorreu um erro inesperado ao processar a foto.")
 
 @dp.message(F.text, StateFilter(None))
-async def handle_text(message: types.Message):
-    global user_history # Ensure global access to avoid NameError
+async def handle_text(message: types.Message, state: FSMContext):
+    global user_history
     try:
         msg_id = f"{message.chat.id}:{message.message_id}"
         if msg_id in processed_messages: return
@@ -1313,7 +1402,6 @@ async def handle_text(message: types.Message):
         
         user_id = message.from_user.id
         
-        # Check if user is in sarcasm mode
         if jailbreak_users.get(user_id):
             if is_apology(message.text):
                 jailbreak_users[user_id] = False
@@ -1326,18 +1414,15 @@ async def handle_text(message: types.Message):
                 await message.answer(sarcasm)
                 return
 
-        # Check for new jailbreak attempt
         if is_jailbreak(message.text):
             jailbreak_users[user_id] = True
             await status_msg.delete()
             await message.answer("Eae amigão, ta tentando mandar um Jailbreak para CaloriesBot? Não vai conseguir.")
             return
 
-        # Busca rápida no histórico antes da IA
         if len(message.text.split()) <= 3:
-            db_match = search_food_history(user_id, message.text.strip())
+            db_match = await search_food_history(user_id, message.text.strip())
             if db_match and db_match[0].get("is_approximate"):
-                # Deixa a IA processar ou poderíamos implementar confirmação
                 pass
 
         items, barcode, error_type, raw_data = await extract_calories_list(
@@ -1346,18 +1431,86 @@ async def handle_text(message: types.Message):
         )
         
         await status_msg.delete()
-        if error_type:
-            await message.answer(f"❌ Erro na extração. Tente novamente.")
+        if error_type == "needs_choice":
+            data = json.loads(raw_data)
+            candidates = data.get("candidates", [])
+            
+            kb = InlineKeyboardMarkup(inline_keyboard=[])
+            for idx, c in enumerate(candidates):
+                btn_text = f"{c['alimento'].capitalize()} ({int(c['calorias'])}kcal/{c['peso']})"
+                if len(btn_text) > 40: btn_text = btn_text[:37] + "..."
+                kb.inline_keyboard.append([InlineKeyboardButton(text=btn_text, callback_data=f"fsc_{idx}")])
+            
+            kb.inline_keyboard.append([InlineKeyboardButton(text="❌ Nenhuma destas", callback_data="fsc_none")])
+            
+            await state.update_data(fs_candidates=candidates, original_text=message.text)
+            await message.answer("🔍 **Encontrei algumas opções.** Qual se aproxima mais do que você consumiu?", reply_markup=kb, parse_mode="Markdown")
+            await state.set_state(FatSecretState.waiting_for_choice)
+            return
+            
+        elif error_type:
+            await message.answer(f"❌ Erro na extração a partir do texto. Tente novamente.")
             return
             
         if items is not None and len(items) == 0:
-            await message.answer("🤔 Não identifiquei alimentos.")
+            await message.answer("🤔 Não identifiquei alimentos. Pode ser mais específico?")
             return
 
         await process_food_entry(message, items, raw_data)
     except Exception as e:
         logger.error(f"Erro no handle_text: {e}")
         await message.answer("❌ Ocorreu um erro inesperado.")
+
+@dp.callback_query(FatSecretState.waiting_for_choice, F.data.startswith("fsc_"))
+async def process_fs_choice(callback: types.CallbackQuery, state: FSMContext):
+    """Lida com a seleção do usuário na multi-escolha do FatSecret."""
+    choice = callback.data.split("_")[1]
+    
+    if choice == "none":
+        await callback.message.edit_text("Entendido. Opções ignoradas. Tente descrever com outras palavras ou mande uma foto do rótulo!")
+        await state.clear()
+        return
+        
+    data = await state.get_data()
+    candidates = data.get("fs_candidates", [])
+    original_text = data.get("original_text", "")
+    
+    try:
+        idx = int(choice)
+        if idx < 0 or idx >= len(candidates):
+            raise ValueError()
+    except:
+        await callback.answer("Opção inválida.")
+        await state.clear()
+        return
+        
+    chosen = candidates[idx]
+    chosen["alimento"] = chosen.get("original_query", chosen["alimento"])
+    
+    emb = await get_embedding(chosen["alimento"])
+    if emb: chosen["embedding"] = emb
+    await save_to_universal_catalog(chosen)
+    
+    await callback.message.edit_text(f"✅ Você escolheu: **{chosen['alimento']}**.\nCalculando porção...", parse_mode="Markdown")
+    
+    # Prossegue com text extraction usando o candidato selecionado como base
+    items, barcode, error_type, raw_data = await extract_calories_list(
+        user_id=callback.from_user.id,
+        message_text=original_text,
+        fs_chosen_candidate=chosen
+    )
+    
+    await state.clear()
+    
+    if error_type:
+        await callback.message.answer(f"❌ Erro na extração. Tente novamentee.")
+        return
+        
+    if items is not None and len(items) == 0:
+        await callback.message.answer("🤔 Opcão selecionada não gerou nenhum alimento válido na porção descrita.")
+        return
+        
+    await process_food_entry(callback.message, items, raw_data)
 
 # --- FastAPI Webhook ---
 
@@ -1392,12 +1545,12 @@ async def reminder_loop():
             now_br = get_br_now()
             hour = now_br.hour
             if 10 <= hour <= 22:
-                res = supabase.table("profiles").select("user_id").execute()
+                res = await async_execute(supabase.table("profiles").select("user_id"))
                 users = res.data or []
                 today_start = get_br_today_start()
                 for user in users:
                     uid = user['user_id']
-                    log_res = supabase.table("logs").select("id").eq("user_id", str(uid)).gte("created_at", today_start).limit(1).execute()
+                    log_res = await async_execute(supabase.table("logs").select("id").eq("user_id", str(uid)).gte("created_at", today_start).limit(1))
                     if not log_res.data and hour in [11, 16, 20]:
                         msg = "🔔 Registro pendente! Vamos focar na dieta? 💪🍎"
                         await bot.send_message(uid, msg, parse_mode="Markdown")

@@ -694,10 +694,13 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
         DADOS DE BUSCA (Se houver): {json.dumps(search_context, ensure_ascii=False)}
         
         SCHEMA: {{"foods": [{{"alimento": str, "peso": str, "calorias": int, "proteina": float, "carboidratos": float, "gorduras": float, "refeicao": str}}], "barcode": str}}
+        
         REGRAS: 
-        1. Se houver dados de busca compatíveis, USE-OS como base para calibrar os macros.
-        2. ESCALE os valores para a quantidade que você ver na imagem ou ler no texto.
-        3. Se não houver peso, use 100g.
+        1. Se houver dados de busca compatíveis, USE-OS como base para os macros.
+        2. Olhe a chave "peso" dos dados de busca.
+        3. Se for "100g", estime o peso da comida na foto em gramas e faça Regra de Três.
+        4. Se for "1 unidade" (lanche/fast food), apenas CONTE quantos lanches tem na foto e multiplique diretamente.
+        5. Se não houver dados de busca, use sua melhor estimativa.
         """
         contents = [prompt]
         if message_text: contents.append(message_text)
@@ -722,18 +725,24 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
 
         prompt = f"""
         Você é um nutricionista especialista. Extraia os alimentos e seus macros do texto usuario.
-        USE OS DADOS DE BUSCA ABAIXO COMO REFERÊNCIA DE CALORIAS POR PORÇÃO.
+        USE OS DADOS DE BUSCA ABAIXO COMO REFERÊNCIA DE CALORIAS E PORÇÕES.
         
         DADOS DE BUSCA: {json.dumps(search_context, ensure_ascii=False)}
         TEXTO DO USUÁRIO: "{message_text}"
 
-        REGRAS MATEMÁTICAS RÍGIDAS (REGRA DE TRÊS):
-        1. Identifique a quantidade no texto (ex: "30g", "2 fatias").
-        2. Use os DADOS DE BUSCA para saber quanto vale a porção base e o seu peso em gramas.
-        3. APLIQUE A FÓRMULA EXATA DE REGRA DE TRÊS: (Quantidade do Usuário / Quantidade da Referência) * Calorias da Referência.
-        4. Exemplo: Se os dados base dizem 355kcal em 100g, e o usuário comeu 30g, FAÇA (30/100) * 355 = 106.5kcal. Arredonde para inteiro. Pondere os outros macros com a mesma lógica!
-        5. No campo "peso", se a quantidade informada for a mesma que o peso (ex: "200g"), retorne apenas "200g". Caso contrário, mostre ambos (ex: "2 fatias (52g)").
-        6. Retorne APENAS um objeto JSON com a chave "itens".
+        REGRAS MATEMÁTICAS RÍGIDAS:
+        1. Identifique a quantidade que o usuário consumiu no texto.
+        2. Olhe a chave "peso" do alimento correspondente nos DADOS DE BUSCA.
+        3. SE O PESO BASE FOR "100g" (Regra de Três):
+           - Fórmula: (Quantidade do Usuário em gramas / 100) * Calorias.
+           - Se o usuário falou em medidas caseiras (fatia, colher), estime o peso em gramas antes de calcular.
+        4. SE O PESO BASE FOR "1 unidade" (Fast Food / Porção Fechada):
+           - Multiplicação Direta: (Quantidade de lanches) * Calorias.
+           - Exemplo: Se os dados dizem "1 unidade = 550kcal" e o usuário comeu "2", retorne 1100kcal. 
+           - Ignore tentativas de calcular em gramas se for um lanche fechado.
+        5. Pondere TODOS os outros macros (proteina, carboidratos, gorduras) usando a mesma regra que usou para as calorias. Arredonde para números inteiros.
+        6. No campo "peso", descreva o que foi calculado (Ex: "2 unidades", ou "150g", ou "2 fatias (50g)").
+        7. Retorne APENAS um objeto JSON com a chave "itens".
         
         SCHEMA: {{"itens": [{{"alimento": str, "peso": str, "calorias": int, "proteina": float, "carboidratos": float, "gorduras": float, "refeicao": str, "is_precise": bool}}]}}
         """

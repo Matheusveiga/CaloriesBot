@@ -290,33 +290,69 @@ async def save_to_universal_catalog(item: dict):
         logger.error(f"Erro ao salvar no catálogo: {e}")
         return False
 
-async def search_universal_catalog(query_embedding: list, threshold: float = 0.85):
-    """Performs semantic search in the universal_catalog table."""
+async def search_universal_catalog(query_embedding: list = None, threshold: float = 0.70, keyword: str = None):
+    """Realiza busca híbrida: Texto (ILIKE) + Semântica (Vetor) com deduplicação."""
     try:
-        res = await async_execute(supabase.rpc("match_food_catalog", {
-            "query_embedding": query_embedding,
-            "match_threshold": threshold,
-            "match_count": 5
-        }))
-        logger.info(f"Supabase Vector Search result: {len(res.data) if res.data else 0} items")
+        results = []
+        seen_foods = set()
         
-        if res.data:
-            results = []
-            for item in res.data:
-                results.append({
-                    "alimento": item.get("food"),
-                    "peso": item.get("serving_size", "100g"),
-                    "calorias": item.get("kcal", 0),
-                    "proteina": item.get("protein", 0),
-                    "carboidratos": item.get("carbs", 0),
-                    "gorduras": item.get("fat", 0),
-                    "is_precise": True,
-                    "is_universal": True
-                })
-            return results
-        return None
+        # 1. Busca por Texto (ILIKE) - Prioridade para nomes exatos/marcas
+        if keyword:
+            # Tentamos o termo completo e também o termo essencial (ex: 'whopper' de 'sanduíche whopper')
+            search_terms = [keyword]
+            if len(keyword.split()) > 1:
+                search_terms.append(keyword.split()[-1]) # Tenta a última palavra como fallback
+            
+            for term in search_terms:
+                res_kw = await async_execute(
+                    supabase.table("universal_catalog")
+                    .select("*")
+                    .ilike("food", f"%{term}%")
+                    .limit(5)
+                )
+                if res_kw.data:
+                    for item in res_kw.data:
+                        if item["food"] not in seen_foods:
+                            seen_foods.add(item["food"])
+                            results.append({
+                                "alimento": item.get("food"),
+                                "peso": item.get("serving_size", "100g"),
+                                "calorias": item.get("kcal", 0),
+                                "proteina": item.get("protein", 0),
+                                "carboidratos": item.get("carbs", 0),
+                                "gorduras": item.get("fat", 0),
+                                "is_precise": True,
+                                "is_universal": True,
+                                "search_method": f"keyword_{term}"
+                            })
+                    if results: break # Se achou por texto, não precisa do fallback de palavra única
+
+        # 2. Busca Semântica (Vector) - Fallback para sinônimos/descrições
+        if query_embedding:
+            res_vec = await async_execute(supabase.rpc("match_food_catalog", {
+                "query_embedding": query_embedding,
+                "match_threshold": threshold, # Threshold de 0.70 conforme sugerido
+                "match_count": 5
+            }))
+            
+            if res_vec.data:
+                for item in res_vec.data:
+                    if item["food"] not in seen_foods:
+                        seen_foods.add(item["food"])
+                        results.append({
+                            "alimento": item.get("food"),
+                            "peso": item.get("serving_size", "100g"),
+                            "calorias": item.get("kcal", 0),
+                            "proteina": item.get("protein", 0),
+                            "carboidratos": item.get("carbs", 0),
+                            "gorduras": item.get("fat", 0),
+                            "is_precise": True,
+                            "is_universal": True,
+                            "search_method": "vector"
+                        })
+        return results if results else None
     except Exception as e:
-        logger.error(f"Erro na busca vetorial: {e}")
+        logger.error(f"Erro na busca do catálogo: {e}")
         return None
 
 async def get_user_profile(user_id: str):
@@ -512,13 +548,17 @@ async def generate_surgical_query(food_name: str):
     if not groq_client: return {"pt": food_name, "en_spec": food_name, "en_gen": food_name}
     
     prompt = f"""
-    Extraia o nome do alimento. Retorne JSON com 3 variações:
-    1. "pt": Nome limpo em português.
+    Extraia o nome do alimento do texto do usuário.
+    Retorne JSON com 3 variações:
+    1. "pt": Nome LIMPO em português (REMOVA quantidades como "1", "2 unidades", "100g").
     2. "en_spec": Nome específico em inglês (com marca/tipo).
     3. "en_gen": Nome genérico em inglês (apenas o tipo de alimento).
     
-    Exemplo: "2 fatias de pão de forma visconti" -> 
-    {{"pt": "pão de forma visconti", "en_spec": "sliced bread visconti", "en_gen": "sliced white bread"}}
+    Exemplo: "2 Big Macs" -> 
+    {{"pt": "big mac", "en_spec": "Mcdonalds big mac", "en_gen": "hamburger"}}
+    
+    Exemplo: "1 whopper" ->
+    {{"pt": "whopper", "en_spec": "burger king whopper", "en_gen": "hamburger"}}
     
     Entrada: "{food_name}"
     """
@@ -659,8 +699,8 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
             clean_name_pt = queries.get("pt", message_text)
             
             emb = await get_embedding(clean_name_pt)
-            if emb:
-                match = await search_universal_catalog(emb, threshold=0.75) # threshold ajustado
+            if emb or clean_name_pt:
+                match = await search_universal_catalog(query_embedding=emb, threshold=0.75, keyword=clean_name_pt)
                 if match:
                     if len(match) > 1:
                         logger.info("Multiple Catalog candidates found. Requesting user choice.")

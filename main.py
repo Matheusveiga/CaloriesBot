@@ -296,22 +296,24 @@ async def search_universal_catalog(query_embedding: list, threshold: float = 0.8
         res = await async_execute(supabase.rpc("match_food_catalog", {
             "query_embedding": query_embedding,
             "match_threshold": threshold,
-            "match_count": 1
+            "match_count": 5
         }))
-        logger.info(f"Supabase Vector Search result: {res.data}")
+        logger.info(f"Supabase Vector Search result: {len(res.data) if res.data else 0} items")
         
         if res.data:
-            item = res.data[0]
-            return [{
-                "alimento": item.get("food"),
-                "peso": item.get("serving_size", "100g"),
-                "calorias": item.get("kcal", 0),
-                "proteina": item.get("protein", 0),
-                "carboidratos": item.get("carbs", 0),
-                "gorduras": item.get("fat", 0),
-                "is_precise": True,
-                "is_universal": True
-            }]
+            results = []
+            for item in res.data:
+                results.append({
+                    "alimento": item.get("food"),
+                    "peso": item.get("serving_size", "100g"),
+                    "calorias": item.get("kcal", 0),
+                    "proteina": item.get("protein", 0),
+                    "carboidratos": item.get("carbs", 0),
+                    "gorduras": item.get("fat", 0),
+                    "is_precise": True,
+                    "is_universal": True
+                })
+            return results
         return None
     except Exception as e:
         logger.error(f"Erro na busca vetorial: {e}")
@@ -652,12 +654,21 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
     else:
         # 1. Search Catalog (Vector)
         if message_text and not image_bytes:
-            emb = await get_embedding(message_text)
+            # Novo: Extrair o nome limpo em PT antes do embedding para não sujar com as quantidades/marcas
+            queries = await generate_surgical_query(message_text)
+            clean_name_pt = queries.get("pt", message_text)
+            
+            emb = await get_embedding(clean_name_pt)
             if emb:
-                match = await search_universal_catalog(emb)
+                match = await search_universal_catalog(emb, threshold=0.75) # threshold ajustado
                 if match:
-                    logger.info(f"🎯 Catalog Context Hit: {message_text}")
-                    search_context.extend(match)
+                    if len(match) > 1:
+                        logger.info("Multiple Catalog candidates found. Requesting user choice.")
+                        return [], None, "needs_choice", json.dumps({"candidates": match, "source": "catalog"})
+                    else:
+                        cand = match[0]
+                        logger.info(f"🎯 Catalog Single Context Hit: {cand['alimento']}")
+                        search_context.append(cand)
 
         # 2. Search FatSecret (Text only fallback)
         if not image_bytes and message_text and not search_context:
@@ -665,7 +676,7 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
             if fs_res:
                 if len(fs_res) > 1:
                     logger.info("Multiple FatSecret candidates found. Requesting user choice.")
-                    return [], None, "needs_choice", json.dumps({"candidates": fs_res})
+                    return [], None, "needs_choice", json.dumps({"candidates": fs_res, "source": "fatsecret"})
                 elif len(fs_res) == 1:
                     cand = fs_res[0]
                     logger.info(f"🔍 FatSecret Single Context Hit: {cand['alimento']}")
@@ -716,12 +727,13 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
         DADOS DE BUSCA: {json.dumps(search_context, ensure_ascii=False)}
         TEXTO DO USUÁRIO: "{message_text}"
 
-        REGRAS:
-        1. Identifique a quantidade no texto (ex: "2 fatias").
-        2. Use os DADOS DE BUSCA para saber quanto vale 1 porção e o seu peso em gramas.
-        3. FAÇA A CONTA e retorne os macros ajustados para a quantidade do usuário.
-        4. No campo "peso", se a quantidade informada for a mesma que o peso (ex: "200g"), retorne apenas "200g". Caso contrário, mostre ambos (ex: "2 fatias (52g)").
-        5. Retorne APENAS um objeto JSON com a chave "itens".
+        REGRAS MATEMÁTICAS RÍGIDAS (REGRA DE TRÊS):
+        1. Identifique a quantidade no texto (ex: "30g", "2 fatias").
+        2. Use os DADOS DE BUSCA para saber quanto vale a porção base e o seu peso em gramas.
+        3. APLIQUE A FÓRMULA EXATA DE REGRA DE TRÊS: (Quantidade do Usuário / Quantidade da Referência) * Calorias da Referência.
+        4. Exemplo: Se os dados base dizem 355kcal em 100g, e o usuário comeu 30g, FAÇA (30/100) * 355 = 106.5kcal. Arredonde para inteiro. Pondere os outros macros com a mesma lógica!
+        5. No campo "peso", se a quantidade informada for a mesma que o peso (ex: "200g"), retorne apenas "200g". Caso contrário, mostre ambos (ex: "2 fatias (52g)").
+        6. Retorne APENAS um objeto JSON com a chave "itens".
         
         SCHEMA: {{"itens": [{{"alimento": str, "peso": str, "calorias": int, "proteina": float, "carboidratos": float, "gorduras": float, "refeicao": str, "is_precise": bool}}]}}
         """
@@ -744,7 +756,7 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
 
     return [], None, None, None
 
-def extract_amount(text: str) -> Optional[float]:
+def extract_amount(text: str, pkg_weight: float = None) -> Optional[float]:
     """Extracts weight (g) or volume (ml) from text. Handles fractions and household measures."""
     if not text: return None
     t = str(text).lower().replace(",", ".")
@@ -760,9 +772,10 @@ def extract_amount(text: str) -> Optional[float]:
     ]
 
     fractions = {
-        "meio": 0.5, "metade": 0.5, "1/2": 0.5,
+        "todo": 1.0, "toda": 1.0, "inteiro": 1.0, "inteira": 1.0, "1 pacote": 1.0, "uma garrafa": 1.0, "1 lata": 1.0,
+        "meio": 0.5, "metade": 0.5, "1/2": 0.5, "meia": 0.5,
         "um quarto": 0.25, "1/4": 0.25,
-        "um terço": 0.33, "1/3": 0.33,
+        "um terço": 0.333, "1/3": 0.333,
         "três quartos": 0.75, "3/4": 0.75
     }
     for word, mult in fractions.items():
@@ -770,6 +783,8 @@ def extract_amount(text: str) -> Optional[float]:
             for pattern, factor in household:
                 if re.search(rf"{word}\s*{pattern}", t):
                     return mult * factor
+            if pkg_weight:
+                return mult * pkg_weight
     
     for pattern, factor in household:
         match = re.search(rf"(\d+[\.,]?\d*)?\s*{pattern}", t)
@@ -816,12 +831,20 @@ async def get_barcode_data(barcode: str):
                 if data.get("status") == 1:
                     product = data.get("product", {})
                     nutriments = product.get("nutriments", {})
+                    
+                    pkg_qty = product.get('product_quantity')
+                    try:
+                        pkg_weight = float(pkg_qty) if pkg_qty else None
+                    except:
+                        pkg_weight = None
+
                     return {
                         "alimento": f"{product.get('product_name', 'Desconhecido')} ({product.get('brands', '')})",
                         "kcal_100g": nutriments.get("energy-kcal_100g", 0),
                         "prot_100g": nutriments.get("proteins_100g", 0),
                         "carb_100g": nutriments.get("carbohydrates_100g", 0),
                         "fat_100g": nutriments.get("fat_100g", 0),
+                        "pkg_weight": pkg_weight,
                     }
         except Exception as e:
             logger.error(f"Erro ao buscar OpenFoodFacts: {e}")
@@ -1168,14 +1191,18 @@ async def process_barcode_portion(message: types.Message, state: FSMContext):
         return
 
     # Extract weight/portion
-    grams = extract_amount(message.text)
+    grams = extract_amount(message.text, pkg_weight=product.get("pkg_weight"))
     
     # Simple heuristic if no 'g' found
     if not grams:
+        if any(f in message.text.lower() for f in ["meio", "metade", "1/2", "meia", "um quarto", "1/4", "um terço", "1/3", "três quartos", "3/4", "todo", "toda", "inteiro", "inteira", "pacote", "lata"]):
+            await message.answer("❌ Não tenho os dados do peso total da embalagem deste produto. Por favor, diga a quantidade exata (ex: 150g, 2 fatias).")
+            return
+            
         try:
             grams = float(message.text.split()[0].replace(",", "."))
         except:
-            await message.answer("❌ Não entendi a quantidade. Digite algo como '100g' ou '200'.")
+            await message.answer("❌ Não entendi a quantidade. Digite algo como '100g' ou 'meio pacote'.")
             return
 
     # Calculate macros based on 100g base
@@ -1434,6 +1461,7 @@ async def handle_text(message: types.Message, state: FSMContext):
         if error_type == "needs_choice":
             data = json.loads(raw_data)
             candidates = data.get("candidates", [])
+            source = data.get("source", "fatsecret")
             
             kb = InlineKeyboardMarkup(inline_keyboard=[])
             for idx, c in enumerate(candidates):
@@ -1443,8 +1471,11 @@ async def handle_text(message: types.Message, state: FSMContext):
             
             kb.inline_keyboard.append([InlineKeyboardButton(text="❌ Nenhuma destas", callback_data="fsc_none")])
             
-            await state.update_data(fs_candidates=candidates, original_text=message.text)
-            await message.answer("🔍 **Encontrei algumas opções.** Qual se aproxima mais do que você consumiu?", reply_markup=kb, parse_mode="Markdown")
+            await state.update_data(fs_candidates=candidates, original_text=message.text, choice_source=source)
+            if source == "catalog":
+                await message.answer("✅ **Encontrei no nosso banco verificado.** Qual se aproxima mais do que você consumiu?", reply_markup=kb, parse_mode="Markdown")
+            else:
+                await message.answer("🔍 **Encontrei opções globais.** Qual se aproxima mais do que você consumiu?", reply_markup=kb, parse_mode="Markdown")
             await state.set_state(FatSecretState.waiting_for_choice)
             return
             
@@ -1463,17 +1494,60 @@ async def handle_text(message: types.Message, state: FSMContext):
 
 @dp.callback_query(FatSecretState.waiting_for_choice, F.data.startswith("fsc_"))
 async def process_fs_choice(callback: types.CallbackQuery, state: FSMContext):
-    """Lida com a seleção do usuário na multi-escolha do FatSecret."""
+    """Lida com a seleção do usuário na multi-escolha do FatSecret ou Catálogo."""
     choice = callback.data.split("_")[1]
     
-    if choice == "none":
-        await callback.message.edit_text("Entendido. Opções ignoradas. Tente descrever com outras palavras ou mande uma foto do rótulo!")
-        await state.clear()
-        return
-        
     data = await state.get_data()
     candidates = data.get("fs_candidates", [])
     original_text = data.get("original_text", "")
+    source = data.get("choice_source", "fatsecret")
+    
+    if choice == "none":
+        if source == "catalog":
+            await callback.message.edit_text("🔄 Nenhuma serviu? Buscando opções globais (FatSecret)...", parse_mode="Markdown")
+            await state.clear()
+            
+            fs_res = await search_fatsecret(original_text)
+            if fs_res:
+                if len(fs_res) > 1:
+                    kb = InlineKeyboardMarkup(inline_keyboard=[])
+                    for idx, c in enumerate(fs_res):
+                        btn_text = f"{c['alimento'].capitalize()} ({int(c['calorias'])}kcal/{c['peso']})"
+                        if len(btn_text) > 40: btn_text = btn_text[:37] + "..."
+                        kb.inline_keyboard.append([InlineKeyboardButton(text=btn_text, callback_data=f"fsc_{idx}")])
+                    kb.inline_keyboard.append([InlineKeyboardButton(text="❌ Nenhuma destas", callback_data="fsc_none")])
+                    
+                    await state.update_data(fs_candidates=fs_res, original_text=original_text, choice_source="fatsecret")
+                    await callback.message.answer("🔍 **Pesquisa Global.** Qual se aproxima mais?", reply_markup=kb, parse_mode="Markdown")
+                    await state.set_state(FatSecretState.waiting_for_choice)
+                    return
+                elif len(fs_res) == 1:
+                    chosen = fs_res[0]
+                    chosen["alimento"] = chosen.get("original_query", chosen["alimento"])
+                    emb = await get_embedding(chosen["alimento"])
+                    if emb: chosen["embedding"] = emb
+                    await save_to_universal_catalog(chosen)
+                    
+                    msg = await callback.message.answer(f"✅ Encontrado no Global: **{chosen['alimento']}**.\nCalculando porção...", parse_mode="Markdown")
+                    items, barcode, error_type, raw_data = await extract_calories_list(
+                        user_id=callback.from_user.id,
+                        message_text=original_text,
+                        fs_chosen_candidate=chosen
+                    )
+                    if error_type:
+                        await msg.edit_text("❌ Erro na extração. Tente novamentee.")
+                    elif items is not None and len(items) == 0:
+                        await msg.edit_text("🤔 A opção selecionada não gerou nenhum alimento válido.")
+                    else:
+                        await msg.delete() # Remove loading
+                        await process_food_entry(callback.message, items, raw_data)
+                    return
+            await callback.message.answer("❌ Não encontrei nada nem no banco global. Tente descrever com outras palavras!")
+            return
+        else:
+            await callback.message.edit_text("Entendido. Opções ignoradas. Tente descrever com outras palavras ou mande uma foto do rótulo!")
+            await state.clear()
+            return
     
     try:
         idx = int(choice)

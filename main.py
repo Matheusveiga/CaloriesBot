@@ -1374,8 +1374,9 @@ async def process_food_entry(message: types.Message, items: list, raw_data: str)
     )
     await message.answer(response_text, parse_mode="Markdown", reply_markup=kb)
 
-@dp.message(F.photo, StateFilter(None))
+@dp.message(F.photo)
 async def handle_photo(message: types.Message, state: FSMContext):
+    if await state.get_state(): await state.clear()
     try:
         status_msg = await message.answer("Analisando foto... 📸👀")
         
@@ -1416,8 +1417,9 @@ async def handle_photo(message: types.Message, state: FSMContext):
         logger.error(f"Erro no handle_photo: {e}")
         await message.answer("❌ Ocorreu um erro inesperado ao processar a foto.")
 
-@dp.message(F.text, StateFilter(None))
+@dp.message(F.text)
 async def handle_text(message: types.Message, state: FSMContext):
+    if await state.get_state(): await state.clear()
     global user_history
     try:
         msg_id = f"{message.chat.id}:{message.message_id}"

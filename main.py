@@ -1395,7 +1395,7 @@ async def process_barcode_portion(message: types.Message, state: FSMContext):
     }
 
     await state.clear()
-    await process_food_entry(message, [item], "Barcode exact match")
+    await process_food_entry(message, [item], "Barcode exact match", message.from_user.id, message.from_user.full_name)
 
 # --- Reporting ---
 
@@ -1490,22 +1490,22 @@ async def process_report(callback: types.CallbackQuery):
 
 # --- Food and Vision Handling ---
 
-async def process_food_entry(message: types.Message, items: list, raw_data: str):
+async def process_food_entry(message: types.Message, items: list, raw_data: str, user_id: int, user_name: str):
     """Common logic for saving and responding to food entries."""
     if not items:
         return
 
     # Log to DB
-    if not await log_calories(message.from_user.id, message.from_user.full_name, items):
+    if not await log_calories(user_id, user_name, items):
         await message.answer("❌ Erro ao salvar dados no Supabase.")
         return
     
-    stats = await get_daily_stats(message.from_user.id)
-    profile = await get_user_profile(message.from_user.id)
+    stats = await get_daily_stats(user_id)
+    profile = await get_user_profile(user_id)
     if profile and 'tdee' in profile:
         daily_limit = profile['tdee']
     else:
-        logger.warning(f"Perfil não encontrado ou sem TDEE para usuário {message.from_user.id} no momento do registro. Usando fallback.")
+        logger.warning(f"Perfil não encontrado ou sem TDEE para usuário {user_id} no momento do registro. Usando fallback.")
         daily_limit = 2000
     daily_total = stats["kcal"]
     remaining = daily_limit - daily_total
@@ -1593,7 +1593,7 @@ async def handle_photo(message: types.Message, state: FSMContext):
             else:
                 logger.warning(f"Barcode {barcode} detectado mas não encontrado no OpenFoodFacts.")
 
-        await process_food_entry(message, items, raw_data)
+        await process_food_entry(message, items, raw_data, message.from_user.id, message.from_user.full_name)
     except Exception as e:
         logger.error(f"Erro no handle_photo: {e}")
         await message.answer("❌ Ocorreu um erro inesperado ao processar a foto.")
@@ -1665,7 +1665,7 @@ async def handle_text(message: types.Message, state: FSMContext):
             await message.answer("🤔 Não identifiquei alimentos. Pode ser mais específico?")
             return
 
-        await process_food_entry(message, items, raw_data)
+        await process_food_entry(message, items, raw_data, user_id, message.from_user.full_name)
     except Exception as e:
         logger.error(f"Erro no handle_text: {e}")
         await message.answer("❌ Ocorreu um erro inesperado.")
@@ -1718,7 +1718,7 @@ async def process_fs_choice(callback: types.CallbackQuery, state: FSMContext):
                         await msg.edit_text("🤔 A opção selecionada não gerou nenhum alimento válido.")
                     else:
                         await msg.delete() # Remove loading
-                        await process_food_entry(callback.message, items, raw_data)
+                        await process_food_entry(callback.message, items, raw_data, callback.from_user.id, callback.from_user.full_name)
                     return
             await callback.message.answer("❌ Não encontrei nada nem no banco global. Tente descrever com outras palavras!")
             return
@@ -1762,7 +1762,7 @@ async def process_fs_choice(callback: types.CallbackQuery, state: FSMContext):
         await callback.message.answer("🤔 Opcão selecionada não gerou nenhum alimento válido na porção descrita.")
         return
         
-    await process_food_entry(callback.message, items, raw_data)
+    await process_food_entry(callback.message, items, raw_data, callback.from_user.id, callback.from_user.full_name)
 
 # --- FastAPI Webhook ---
 

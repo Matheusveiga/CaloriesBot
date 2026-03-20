@@ -799,6 +799,29 @@ async def search_fatsecret(food_name: str):
             if client is not http_client: await client.aclose()
     return None
 
+async def is_food_message(text: str) -> bool:
+    """Triagem rápida: retorna True se o texto parece registro de alimento,
+    False se parece pergunta/conversa. Usa llama-3.1-8b-instant (barato e rápido).
+    Em caso de erro retorna True para deixar o pipeline principal decidir."""
+    if not groq_client:
+        return True
+    prompt = (
+        'O texto abaixo é um registro de alimento/refeição ou é uma pergunta/conversa?\n'
+        'Responda APENAS com "food" ou "chat". Nenhuma outra palavra.\n\n'
+        f'Texto: "{text}"'
+    )
+    try:
+        r = await groq_client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model="llama-3.1-8b-instant",
+            temperature=0,
+            max_tokens=5,
+        )
+        return r.choices[0].message.content.strip().lower() == "food"
+    except Exception as e:
+        logger.warning(f"is_food_message fallback to pipeline: {e}")
+        return True
+
 async def extract_calories_list(user_id: int, message_text: str = "", image_bytes: bytes = None, fs_chosen_candidate: dict = None):
     # Flow: 1. Search (Catalog + FatSecret) -> 2. Contextual Extraction (Groq/Gemini scales everything)
     
@@ -953,20 +976,36 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
             return [], None, str(e), None
     
     elif message_text:
-        # Tenta extrair o peso usando função Python determinística
+        # Extrai pesos por item (suporta entradas múltiplas)
+        amounts_per_food = extract_amounts_per_food(message_text)
         peso_calculado_python = extract_amount(message_text)
-        regra_peso = ""
-        if peso_calculado_python:
+
+        if amounts_per_food:
+            anchors = "\n".join(
+                f'  - "{frag}": use exatamente {int(g)}g (determinístico, NÃO altere)'
+                for frag, g in amounts_per_food.items()
+            )
             regra_peso = f"""
-            🚨 REGRA ABSOLUTA DE PESO (DETERMINÍSTICA): 
-            O sistema já identificou que o usuário consumiu exatamente {peso_calculado_python}g (ou equivalentes). 
-            NÃO chute o peso! Use {int(peso_calculado_python)}g para sua Regra de Três.
-            """
+🚨 PESOS DETERMINÍSTICOS POR ITEM (não altere nenhum desses valores):
+{anchors}
+Para itens sem âncora acima, use medidas caseiras brasileiras padrão.
+"""
+        elif peso_calculado_python:
+            regra_peso = f"""
+🚨 REGRA ABSOLUTA DE PESO (DETERMINÍSTICA):
+O sistema identificou exatamente {peso_calculado_python}g.
+NÃO chute o peso! Use {int(peso_calculado_python)}g para sua Regra de Três.
+"""
         else:
             regra_peso = """
-            - Se o usuário usou medidas caseiras, use esta tabela de referência brasileira:
-              * 1 fatia = 30g | 1 colher sopa = 15g | 1 xícara = 200g | 1 unidade (ovo/fruta) = 50-60g.
-            """
+- Se o usuário usou medidas caseiras, use esta tabela de referência brasileira:
+  * 1 fatia = 30g | 1 fatia fina = 15g | 1 fatia grossa = 50g
+  * 1 colher sopa = 15g | 1 colher sobremesa = 10g | 1 colher chá = 5g
+  * 1 xícara = 200g | 1 copo = 200g | 1 concha = 80g | 1 pegador = 150g
+  * 1 prato fundo = 350g | 1 prato raso = 250g
+  * 1 bife/filé = 120g | 1 sachê = 30g | 1 lata = 350g
+  * 1 unidade (ovo/fruta pequena) = 50g | 1 unidade (fruta média) = 120g
+"""
 
         # Novo: Buscar contexto recente (últimos 15 min) para suportar adições
         recent_logs = await get_recent_logs(user_id)
@@ -1037,7 +1076,7 @@ def extract_amount(text: str, pkg_weight: float = None) -> Optional[float]:
     """Extracts weight (g) or volume (ml) from text. Handles fractions and household measures."""
     if not text: return None
     t = str(text).lower().replace(",", ".")
-    
+
     household = [
         (r"(colher\s*de\s*sopa|c\.\s*sopa|colher\s*s)", 15),
         (r"(colher\s*de\s*sobremesa)", 10),
@@ -1045,15 +1084,28 @@ def extract_amount(text: str, pkg_weight: float = None) -> Optional[float]:
         (r"(colher\s*de\s*caf[eé])", 2),
         (r"(x[ií]cara)", 200),
         (r"(copo|c\.)", 200),
-        (r"(fatia|f\.)", 30)
+        (r"(fatia\s*grossa)", 50),
+        (r"(fatia\s*fina)", 15),
+        (r"(fatia|f\.)", 30),
+        (r"(prato\s*fundo|prato\s*cheio)", 350),
+        (r"(prato\s*raso)", 250),
+        (r"(concha)", 80),
+        (r"(pegador)", 150),
+        (r"(bife|fil[eé])", 120),
+        (r"(caixinha|caixa\s*pequena)", 200),
+        (r"(lata\b)", 350),
+        (r"(garrafa\s*grande|garrafa\s*pet)", 1000),
+        (r"(garrafa\s*pequena|garrafinha)", 300),
+        (r"(sach[eê])", 30),
     ]
 
     fractions = {
-        "todo": 1.0, "toda": 1.0, "inteiro": 1.0, "inteira": 1.0, "1 pacote": 1.0, "uma garrafa": 1.0, "1 lata": 1.0,
+        "todo": 1.0, "toda": 1.0, "inteiro": 1.0, "inteira": 1.0,
+        "1 pacote": 1.0, "uma garrafa": 1.0, "1 lata": 1.0,
         "meio": 0.5, "metade": 0.5, "1/2": 0.5, "meia": 0.5,
         "um quarto": 0.25, "1/4": 0.25,
         "um terço": 0.333, "1/3": 0.333,
-        "três quartos": 0.75, "3/4": 0.75
+        "três quartos": 0.75, "3/4": 0.75,
     }
     for word, mult in fractions.items():
         if word in t:
@@ -1062,7 +1114,7 @@ def extract_amount(text: str, pkg_weight: float = None) -> Optional[float]:
                     return mult * factor
             if pkg_weight:
                 return mult * pkg_weight
-    
+
     for pattern, factor in household:
         match = re.search(rf"(\d+[\.,]?\d*)?\s*{pattern}", t)
         if match:
@@ -1078,12 +1130,29 @@ def extract_amount(text: str, pkg_weight: float = None) -> Optional[float]:
     if g_match:
         try: return float(g_match.group(1))
         except: pass
-    
+
     num_match = re.search(r"^(\d+[\.,]?\d*)$", t)
     if num_match:
         try: return float(num_match.group(1))
         except: pass
     return None
+
+
+def extract_amounts_per_food(text: str) -> dict[str, float]:
+    """Splits multi-item text and returns {fragment: grams} for each detected item.
+    Ex: '100g de arroz e 2 conchas de feijão' -> {'100g de arroz': 100.0, '2 conchas de feijão': 160.0}
+    """
+    separators = r'\s+e\s+|\s*,\s*|\s+mais\s+|\s+com\s+'
+    parts = re.split(separators, text.lower())
+    result = {}
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        amount = extract_amount(part)
+        if amount is not None:
+            result[part] = amount
+    return result
 
 def calculate_tdee(weight, height, age, gender, activity, goal):
     # Mifflin-St Jeor
@@ -1843,8 +1912,13 @@ async def handle_voice(message: types.Message, state: FSMContext):
         await status_msg.edit_text(f"🗣️ **Você disse:** _{user_text}_\n\nCalculando... 🧐", parse_mode="Markdown")
 
         # 3. Reutiliza exatamente a mesma lógica de texto!
+        if not await is_food_message(user_text):
+            await status_msg.delete()
+            await handle_nutri_chat(message, user_id)
+            return
+
         items, barcode, error_type, raw_data = await extract_calories_list(
-            user_id=user_id, 
+            user_id=user_id,
             message_text=user_text
         )
         
@@ -1891,8 +1965,13 @@ async def handle_text(message: types.Message, state: FSMContext):
             await message.answer("Eae amigão, ta tentando mandar um Jailbreak para CaloriesBot? Não vai conseguir.")
             return
 
+        if not await is_food_message(message.text):
+            await status_msg.delete()
+            await handle_nutri_chat(message, user_id)
+            return
+
         items, barcode, error_type, raw_data = await extract_calories_list(
-            user_id=user_id, 
+            user_id=user_id,
             message_text=message.text
         )
         

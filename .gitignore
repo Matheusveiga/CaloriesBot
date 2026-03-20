@@ -10,3 +10,4 @@ env/
 .idea/
 .agent/
 modular_backup/
+csv_backup/

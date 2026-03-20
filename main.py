@@ -726,8 +726,18 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
     if fs_chosen_candidate:
         search_context.append(fs_chosen_candidate)
     else:
-        # 1. Search Catalog (Vector)
+        # 1. Search Personal History (NEW)
         if message_text and not image_bytes:
+            hist_res = await search_food_history(user_id, message_text)
+            if hist_res:
+                # Se achou no histórico, marcamos como tal para priorizar
+                cand = hist_res[0]
+                cand["is_historical"] = True
+                logger.info(f"💾 History Context Hit: {cand['alimento']}")
+                search_context.append(cand)
+
+        # 2. Search Catalog (Vector)
+        if not search_context and message_text and not image_bytes:
             # Novo: Extrair o nome limpo em PT antes do embedding para não sujar com as quantidades/marcas
             queries = await generate_surgical_query(message_text)
             clean_name_pt = queries.get("pt", message_text)
@@ -744,7 +754,7 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
                         logger.info(f"🎯 Catalog Single Context Hit: {cand['alimento']}")
                         search_context.append(cand)
 
-        # 2. Search FatSecret (Text only fallback)
+        # 3. Search FatSecret (Text only fallback)
         if not image_bytes and message_text and not search_context:
             fs_res = await search_fatsecret(message_text)
             if fs_res:
@@ -798,13 +808,47 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
         try:
             res = await ai_client.aio.models.generate_content(
                 model=AI_MODEL, contents=contents,
-                config=ai_types.GenerateContentConfig(response_mime_type="application/json")
+                config=ai_types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema={
+                        "type": "OBJECT",
+                        "properties": {
+                            "is_nutrition_label": {"type": "BOOLEAN"},
+                            "foods": {
+                                "type": "ARRAY",
+                                "items": {
+                                    "type": "OBJECT",
+                                    "properties": {
+                                        "alimento": {"type": "STRING"},
+                                        "raciocinio_matematico": {"type": "STRING"},
+                                        "peso": {"type": "STRING"},
+                                        "calorias": {"type": "INTEGER"},
+                                        "proteina": {"type": "NUMBER"},
+                                        "carboidratos": {"type": "NUMBER"},
+                                        "gorduras": {"type": "NUMBER"},
+                                        "refeicao": {"type": "STRING"}
+                                    }
+                                }
+                            },
+                            "barcode": {"type": "STRING"}
+                        }
+                    }
+                )
             )
             raw_text = res.text
             logger.info(f"Gemini Vision Raw Response: {raw_text}")
             data = json.loads(raw_text)
             is_label = data.get("is_nutrition_label", False)
             foods = data.get("foods", [])
+
+            # Recover flags if we used search_context
+            if search_context:
+                for f in foods:
+                    f["is_precise"] = True
+                    if any(ctx.get("is_universal") for ctx in search_context): f["is_universal"] = True
+                    if any(ctx.get("is_historical") for ctx in search_context): f["is_historical"] = True
+                    if any(ctx.get("is_fs_verified") for ctx in search_context): f["is_fs_verified"] = True
+
             if is_label:
                 logger.info("🏷️ Tabela nutricional detectada — lendo macros direto do rótulo.")
                 for f in foods:
@@ -819,6 +863,21 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
             return [], None, str(e), None
     
     elif message_text:
+        # Tenta extrair o peso usando função Python determinística
+        peso_calculado_python = extract_amount(message_text)
+        regra_peso = ""
+        if peso_calculado_python:
+            regra_peso = f"""
+            🚨 REGRA ABSOLUTA DE PESO (DETERMINÍSTICA): 
+            O sistema já identificou que o usuário consumiu exatamente {peso_calculado_python}g (ou equivalentes). 
+            NÃO chute o peso! Use {int(peso_calculado_python)}g para sua Regra de Três.
+            """
+        else:
+            regra_peso = """
+            - Se o usuário usou medidas caseiras, use esta tabela de referência brasileira:
+              * 1 fatia = 30g | 1 colher sopa = 15g | 1 xícara = 200g | 1 unidade (ovo/fruta) = 50-60g.
+            """
+
         # Use Groq for TEXT extraction + scaling
         if not groq_client: return [], None, "Groq client not init", None
 
@@ -830,20 +889,16 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
         TEXTO DO USUÁRIO: "{message_text}"
 
         REGRAS MATEMÁTICAS RÍGIDAS:
-        1. Identifique a quantidade que o usuário consumiu no texto.
-        2. Olhe a chave "peso" do alimento correspondente nos DADOS DE BUSCA.
+        1. Identifique a quantidade consumida.
+        2. {regra_peso}
         3. SE O PESO BASE FOR "100g" (Regra de Três):
-           - Fórmula: (Quantidade do Usuário em gramas / 100) * Calorias.
-           - Se o usuário falou em medidas caseiras (fatia, colher), estime o peso em gramas antes de calcular.
+           - Fórmula: (Quantidade do Usuário / 100) * Macros Base.
         4. SE O PESO BASE FOR "1 unidade" (Fast Food / Porção Fechada):
-           - Multiplicação Direta: (Quantidade de lanches) * Calorias.
-           - Exemplo: Se os dados dizem "1 unidade = 550kcal" e o usuário comeu "2", retorne 1100kcal. 
-           - Ignore tentativas de calcular em gramas se for um lanche fechado.
-        5. Pondere TODOS os outros macros (proteina, carboidratos, gorduras) usando a mesma regra que usou para as calorias. Arredonde para números inteiros.
-        6. No campo "peso", descreva o que foi calculado (Ex: "2 unidades", ou "150g", ou "2 fatias (50g)").
-        7. Retorne APENAS um objeto JSON com a chave "itens".
+           - Multiplicação Direta: (Quantidade de lanches) * Macros Base.
+        5. Explique seu cálculo matemático detalhadamente no campo "raciocinio_matematico".
+        6. Retorne um objeto JSON.
         
-        SCHEMA: {{"itens": [{{"alimento": str, "peso": str, "calorias": int, "proteina": float, "carboidratos": float, "gorduras": float, "refeicao": str, "is_precise": bool}}]}}
+        SCHEMA: {{"itens": [{{"alimento": str, "raciocinio_matematico": str, "peso": str, "calorias": int, "proteina": float, "carboidratos": float, "gorduras": float, "refeicao": str, "is_precise": bool}}]}}
         """
         
         try:
@@ -857,6 +912,15 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
             logger.info(f"Groq Unified Extraction Response: {raw_data}")
             parsed = json.loads(raw_data)
             foods = parsed.get("itens") or parsed.get("foods") or []
+            
+            # Recover flags if we used search_context
+            if search_context:
+                for f in foods:
+                    f["is_precise"] = True
+                    if any(ctx.get("is_universal") for ctx in search_context): f["is_universal"] = True
+                    if any(ctx.get("is_historical") for ctx in search_context): f["is_historical"] = True
+                    if any(ctx.get("is_fs_verified") for ctx in search_context): f["is_fs_verified"] = True
+
             # Apply time-based meal type as fallback
             auto_meal = get_meal_type_by_hour()
             for f in foods:
@@ -1512,9 +1576,12 @@ async def process_food_entry(message: types.Message, items: list, raw_data: str,
     
     has_universal = any(i.get("is_universal") for i in items)
     has_fs = any(i.get("is_fs_verified") for i in items)
+    has_historical = any(i.get("is_historical") for i in items)
     
     source_tag = ""
-    if has_universal:
+    if has_historical:
+        source_tag = "✅ `DADO DO SEU HISTÓRICO`\n\n"
+    elif has_universal:
         source_tag = "✅ `DADO VERIFICADO (Catálogo)`\n\n"
     elif has_fs or all(i.get("is_precise") for i in items):
         source_tag = "✅ `DADO VERIFICADO (FatSecret/Scanner)`\n\n"

@@ -850,9 +850,14 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
     if fs_chosen_candidate:
         search_context.append(fs_chosen_candidate)
         # Se temos um candidato escolhido, removemos o item correspondente da lista de queries
-        # para não buscá-lo de novo. Tentamos bater pelo nome original.
-        orig = fs_chosen_candidate.get("original_query", "").lower()
-        all_items_queries = [q for q in all_items_queries if q.get("pt", "").lower() != orig]
+        # para não buscá-lo de novo. Usamos a chave 'resolved_query' que injetamos na escolha.
+        resolved = fs_chosen_candidate.get("resolved_query", "").lower()
+        if resolved:
+            all_items_queries = [q for q in all_items_queries if q.get("pt", "").lower() != resolved]
+        else:
+            # Fallback por nome original se não houver resolved_query
+            orig = fs_chosen_candidate.get("original_query", "").lower()
+            all_items_queries = [q for q in all_items_queries if q.get("pt", "").lower() != orig]
 
     # Para cada item identificado na frase, tentamos achar um contexto (âncora)
     for item_queries in all_items_queries:
@@ -876,7 +881,7 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
                 if match:
                     if len(match) > 1:
                         logger.info(f"Multiple Catalog candidates for '{clean_name_pt}'. Requesting choice.")
-                        return [], None, "needs_choice", json.dumps({"candidates": match, "source": "catalog"})
+                        return [], None, "needs_choice", json.dumps({"candidates": match, "source": "catalog", "query_name": clean_name_pt})
                     else:
                         cand = match[0]
                         logger.info(f"🎯 Catalog Context Hit: {cand['alimento']}")
@@ -889,7 +894,7 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
             if fs_res:
                 if len(fs_res) > 1:
                     logger.info(f"Multiple FatSecret candidates for '{clean_name_pt}'. Requesting choice.")
-                    return [], None, "needs_choice", json.dumps({"candidates": fs_res, "source": "fatsecret"})
+                    return [], None, "needs_choice", json.dumps({"candidates": fs_res, "source": "fatsecret", "query_name": clean_name_pt})
                 elif len(fs_res) == 1:
                     cand = fs_res[0]
                     logger.info(f"🔍 FatSecret Context Hit: {cand['alimento']}")
@@ -1837,7 +1842,12 @@ async def _handle_extraction_result(
             if len(btn_text) > 40: btn_text = btn_text[:37] + "..."
             kb.inline_keyboard.append([InlineKeyboardButton(text=btn_text, callback_data=f"fsc_{idx}")])
         kb.inline_keyboard.append([InlineKeyboardButton(text="❌ Nenhuma destas", callback_data="fsc_none")])
-        await state.update_data(fs_candidates=candidates, original_text=original_text, choice_source=source)
+        await state.update_data(
+            fs_candidates=candidates, 
+            original_text=original_text, 
+            choice_source=source, 
+            query_name=data.get("query_name")
+        )
         if source == "catalog":
             await message.answer("✅ **Encontrei no nosso banco verificado.** Qual se aproxima mais do que você consumiu?", reply_markup=kb, parse_mode="Markdown")
         else:
@@ -2016,6 +2026,7 @@ async def process_fs_choice(callback: types.CallbackQuery, state: FSMContext):
     candidates = data.get("fs_candidates", [])
     original_text = data.get("original_text", "")
     source = data.get("choice_source", "fatsecret")
+    query_name = data.get("query_name")
     
     if choice == "none":
         if source == "catalog":
@@ -2034,7 +2045,12 @@ async def process_fs_choice(callback: types.CallbackQuery, state: FSMContext):
                         kb.inline_keyboard.append([InlineKeyboardButton(text=btn_text, callback_data=f"fsc_{idx}")])
                     kb.inline_keyboard.append([InlineKeyboardButton(text="❌ Nenhuma destas", callback_data="fsc_none")])
                     
-                    await state.update_data(fs_candidates=fs_res, original_text=original_text, choice_source="fatsecret")
+                    await state.update_data(
+                        fs_candidates=fs_res, 
+                        original_text=original_text, 
+                        choice_source="fatsecret", 
+                        query_name=query_name
+                    )
                     await callback.message.answer("🔍 **Pesquisa Global.** Qual se aproxima mais?", reply_markup=kb, parse_mode="Markdown")
                     await state.set_state(FatSecretState.waiting_for_choice)
                     return
@@ -2043,6 +2059,7 @@ async def process_fs_choice(callback: types.CallbackQuery, state: FSMContext):
                     chosen["alimento"] = chosen.get("original_query", chosen["alimento"])
                     emb = await get_embedding(chosen["alimento"])
                     if emb: chosen["embedding"] = emb
+                    if query_name: chosen["resolved_query"] = query_name
                     await save_to_universal_catalog(chosen)
                     
                     msg = await callback.message.answer(f"✅ Encontrado no Global: **{chosen['alimento']}**.\nCalculando porção...", parse_mode="Markdown")
@@ -2080,6 +2097,7 @@ async def process_fs_choice(callback: types.CallbackQuery, state: FSMContext):
     
     emb = await get_embedding(chosen["alimento"])
     if emb: chosen["embedding"] = emb
+    if query_name: chosen["resolved_query"] = query_name
     await save_to_universal_catalog(chosen)
     
     await callback.message.edit_text(f"✅ Você escolheu: **{chosen['alimento']}**.\nCalculando porção...", parse_mode="Markdown")

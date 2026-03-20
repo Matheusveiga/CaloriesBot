@@ -658,24 +658,25 @@ async def get_fatsecret_token():
         finally:
             if client is not http_client: await client.aclose()
 
-async def generate_surgical_query(food_name: str):
-    """Generates clean food names for both PT and EN search with variations."""
-    if not groq_client: return {"pt": food_name, "en_spec": food_name, "en_gen": food_name}
+async def generate_surgical_query(text: str) -> List[Dict[str, str]]:
+    """Generates clean food names for both PT and EN search with variations for one or more items."""
+    if not groq_client: return [{"pt": text, "en_spec": text, "en_gen": text}]
     
     prompt = f"""
-    Extraia o nome do alimento do texto do usuário.
-    Retorne JSON com 3 variações:
+    Extraia os nomes dos alimentos do texto do usuário.
+    Retorne uma LISTA de objetos JSON, um para cada alimento identificado.
+    Cada objeto deve ter 3 variações:
     1. "pt": Nome LIMPO em português (REMOVA quantidades como "1", "2 unidades", "100g").
-    2. "en_spec": Nome específico em inglês (com marca/tipo).
-    3. "en_gen": Nome genérico em inglês (apenas o tipo de alimento).
+    2. "en_spec": Nome específico em inglês (inclua marcas/detalhes se houver).
+    3. "en_gen": Nome genérico em inglês (categoria básica do alimento).
     
-    Exemplo: "2 Big Macs" -> 
-    {{"pt": "big mac", "en_spec": "Mcdonalds big mac", "en_gen": "hamburger"}}
+    Exemplo: "Comi 2 Big Macs e tomei uma coca" -> 
+    [
+      {{"pt": "big mac", "en_spec": "Mcdonalds big mac", "en_gen": "hamburger"}},
+      {{"pt": "coca cola", "en_spec": "coca cola classic", "en_gen": "soda"}}
+    ]
     
-    Exemplo: "1 whopper" ->
-    {{"pt": "whopper", "en_spec": "burger king whopper", "en_gen": "hamburger"}}
-    
-    Entrada: "{food_name}"
+    Texto: "{text}"
     """
     
     try:
@@ -685,19 +686,35 @@ async def generate_surgical_query(food_name: str):
             response_format={"type": "json_object"},
             temperature=0,
         )
-        data = completion.choices[0].message.content
-        logger.info(f"Groq Surgical Query Response: {data}")
-        return json.loads(data)
+        raw_data = completion.choices[0].message.content
+        logger.info(f"Groq Surgical Query Response: {raw_data}")
+        data = json.loads(raw_data)
+        
+        # Ensure we return a list of dicts
+        if isinstance(data, dict):
+            # If the model returned {"items": [...]}, {"foods": [...]}, or just one item dictionary
+            if "items" in data: items = data["items"]
+            elif "foods" in data: items = data["foods"]
+            elif "pt" in data: items = [data]
+            else: items = [data] # Fallback
+        elif isinstance(data, list):
+            items = data
+        else:
+            items = [{"pt": text, "en_spec": text, "en_gen": text}]
+
+        return items if items else [{"pt": text, "en_spec": text, "en_gen": text}]
+
     except Exception as e:
         logger.error(f"Groq surgical query error: {e}")
-        return {"pt": food_name, "en_spec": food_name, "en_gen": food_name}
+        return [{"pt": text, "en_spec": text, "en_gen": text}]
 
-async def search_fatsecret(food_name: str):
+async def search_fatsecret(queries: dict):
+    """Searches FatSecret using pre-generated PT/EN variations."""
     token = await get_fatsecret_token()
     if not token: return None
     
     url = "https://platform.fatsecret.com/rest/server.api"
-    queries = await generate_surgical_query(food_name)
+    # queries is now passed as an argument
     
     # 1. Estratégia: O Genérico em Inglês é a nossa maior chance de sucesso absoluto no banco global.
     for search_key in ["en_gen", "en_spec", "pt"]:
@@ -784,7 +801,7 @@ async def search_fatsecret(food_name: str):
                             "gorduras": float(s.get("fat", 0)),
                             "peso": weight_str,
                             "is_precise": True,
-                            "original_query": queries.get('pt') or food_name,
+                            "original_query": queries.get('pt') or search_term,
                             "is_fs_verified": True
                         }
                         results.append(result)
@@ -823,56 +840,63 @@ async def is_food_message(text: str) -> bool:
         return True
 
 async def extract_calories_list(user_id: int, message_text: str = "", image_bytes: bytes = None, fs_chosen_candidate: dict = None):
-    # Flow: 1. Search (Catalog + FatSecret) -> 2. Contextual Extraction (Groq/Gemini scales everything)
+    all_items_queries = []
     
-    search_context = []
+    if message_text and not image_bytes:
+        all_items_queries = await generate_surgical_query(message_text)
     
     if fs_chosen_candidate:
         search_context.append(fs_chosen_candidate)
-    else:
-        # 1. Search Personal History (NEW)
-        if message_text and not image_bytes:
-            hist_res = await search_food_history(user_id, message_text)
-            if hist_res:
-                # Se achou no histórico, marcamos como tal para priorizar
-                cand = hist_res[0]
-                cand["is_historical"] = True
-                logger.info(f"💾 History Context Hit: {cand['alimento']}")
-                search_context.append(cand)
+        # Se temos um candidato escolhido, removemos o item correspondente da lista de queries
+        # para não buscá-lo de novo. Tentamos bater pelo nome original.
+        orig = fs_chosen_candidate.get("original_query", "").lower()
+        all_items_queries = [q for q in all_items_queries if q.get("pt", "").lower() != orig]
 
-        # 2. Search Catalog (Vector)
-        if not search_context and message_text and not image_bytes:
-            # Novo: Extrair o nome limpo em PT antes do embedding para não sujar com as quantidades/marcas
-            queries = await generate_surgical_query(message_text)
-            clean_name_pt = queries.get("pt", message_text)
+    # Para cada item identificado na frase, tentamos achar um contexto (âncora)
+    for item_queries in all_items_queries:
+        item_found = False
+        clean_name_pt = item_queries.get("pt", message_text)
+        
+        # 1. Search Personal History
+        hist_res = await search_food_history(user_id, clean_name_pt)
+        if hist_res:
+            cand = hist_res[0]
+            cand["is_historical"] = True
+            logger.info(f"💾 History Context Hit: {cand['alimento']}")
+            search_context.append(cand)
+            item_found = True
             
+        # 2. Search Catalog (Vector)
+        if not item_found:
             emb = await get_embedding(clean_name_pt)
             if emb or clean_name_pt:
                 match = await search_universal_catalog(query_embedding=emb, threshold=0.88, keyword=clean_name_pt)
                 if match:
                     if len(match) > 1:
-                        logger.info("Multiple Catalog candidates found. Requesting user choice.")
+                        logger.info(f"Multiple Catalog candidates for '{clean_name_pt}'. Requesting choice.")
                         return [], None, "needs_choice", json.dumps({"candidates": match, "source": "catalog"})
                     else:
                         cand = match[0]
-                        logger.info(f"🎯 Catalog Single Context Hit: {cand['alimento']}")
+                        logger.info(f"🎯 Catalog Context Hit: {cand['alimento']}")
                         search_context.append(cand)
-
+                        item_found = True
+                        
         # 3. Search FatSecret (Text only fallback)
-        if not image_bytes and message_text and not search_context:
-            fs_res = await search_fatsecret(message_text)
+        if not item_found:
+            fs_res = await search_fatsecret(item_queries)
             if fs_res:
                 if len(fs_res) > 1:
-                    logger.info("Multiple FatSecret candidates found. Requesting user choice.")
+                    logger.info(f"Multiple FatSecret candidates for '{clean_name_pt}'. Requesting choice.")
                     return [], None, "needs_choice", json.dumps({"candidates": fs_res, "source": "fatsecret"})
                 elif len(fs_res) == 1:
                     cand = fs_res[0]
-                    logger.info(f"🔍 FatSecret Single Context Hit: {cand['alimento']}")
+                    logger.info(f"🔍 FatSecret Context Hit: {cand['alimento']}")
                     cand["alimento"] = cand.get("original_query", cand["alimento"])
                     emb = await get_embedding(cand["alimento"])
                     cand["embedding"] = emb
                     await save_to_universal_catalog(cand)
                     search_context.append(cand)
+                    item_found = True
 
     # 3. Model extraction with Context
     if image_bytes:
@@ -1016,7 +1040,7 @@ NÃO chute o peso! Use {int(peso_calculado_python)}g para sua Regra de Três.
 
         prompt = f"""
         Você é um nutricionista especialista. Extraia os alimentos e seus macros do texto usuario.
-        USE OS DADOS DE BUSCA ABAIXO COMO REFERÊNCIA DE CALORIAS E PORÇÕES.
+        DADOS DE BUSCA (Se houver): {json.dumps(search_context, ensure_ascii=False)}
         CONTEXTO RECENTE (Últimos 15 min): {contexto_recente_str}
         
         TEXTO DO USUÁRIO: "{message_text}"
@@ -1996,7 +2020,9 @@ async def process_fs_choice(callback: types.CallbackQuery, state: FSMContext):
             await callback.message.edit_text("🔄 Nenhuma serviu? Buscando opções globais (FatSecret)...", parse_mode="Markdown")
             await state.clear()
             
-            fs_res = await search_fatsecret(original_text)
+            queries_list = await generate_surgical_query(original_text)
+            queries = queries_list[0] if queries_list else {"pt": original_text, "en_spec": original_text, "en_gen": original_text}
+            fs_res = await search_fatsecret(queries)
             if fs_res:
                 if len(fs_res) > 1:
                     kb = InlineKeyboardMarkup(inline_keyboard=[])

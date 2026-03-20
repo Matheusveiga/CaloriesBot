@@ -9,6 +9,8 @@ import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Dict, Any, List, Optional
+import itertools
+from contextlib import asynccontextmanager
 
 import matplotlib.pyplot as plt
 import matplotlib
@@ -46,7 +48,17 @@ WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL")
 
 # Init Clients
 bot = Bot(token=TELEGRAM_TOKEN)
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await bot.set_webhook(url=f"{WEBHOOK_URL}/webhook")
+    logger.info(f"Webhook set to {WEBHOOK_URL}/webhook")
+    asyncio.create_task(reminder_loop())
+    yield
+    await http_client.aclose()
+    logger.info("HTTP client closed.")
+
+app = FastAPI(lifespan=lifespan)
 ai_client = genai.Client(api_key=GEMINI_KEY)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 # Ensure the client has the apikey header for all requests (redundant but safe)
@@ -56,13 +68,12 @@ supabase.postgrest.auth(SUPABASE_KEY)
 http_client = httpx.AsyncClient(timeout=httpx.Timeout(15.0), follow_redirects=True)
 
 # FatSecret Proxy Rotation
-fs_proxy_index = 0
+_fs_proxy_cycle = itertools.cycle(FATSECRET_PROXIES) if FATSECRET_PROXIES else None
+
 def get_fs_client():
-    global fs_proxy_index
-    if not FATSECRET_PROXIES:
+    if not _fs_proxy_cycle:
         return http_client
-    proxy_url = FATSECRET_PROXIES[fs_proxy_index % len(FATSECRET_PROXIES)]
-    fs_proxy_index += 1
+    proxy_url = next(_fs_proxy_cycle)
     return httpx.AsyncClient(proxy=proxy_url, timeout=httpx.Timeout(15.0))
 
 groq_client = None
@@ -96,7 +107,7 @@ class FatSecretState(StatesGroup):
     waiting_for_choice = State()
 
 # Global State
-processed_messages = set()
+processed_messages: dict[str, float] = {}
 fs_token = {"access_token": None, "expires_at": 0}
 fs_lock = asyncio.Lock()
 user_history = {}
@@ -163,6 +174,61 @@ async def generate_sarcastic_response(user_id: int, message_text: str):
                     return res.json()["choices"][0]["message"]["content"].strip()
             except: pass
         return "Ah, que original. Outra tentativa brilhante. 🙄"
+
+async def handle_nutri_chat(message: types.Message, user_id: int):
+    """Fallback conversation handler: Acts as a Personal Nutri/Trainer using Groq."""
+    global user_history
+    
+    if not groq_client:
+        await message.answer("Opa, meu cérebro está offline no momento. Tente de novo! 😅")
+        return
+    
+    # 1. Contexto do usuário para a IA saber com quem está falando
+    profile = await get_user_profile(user_id)
+    stats = await get_daily_stats(user_id)
+    
+    contexto_usuario = f"Nome: {message.from_user.first_name}\n"
+    if profile:
+        contexto_usuario += f"Objetivo: {profile.get('goal', 'Manter')}, Meta: {profile.get('tdee', 2000)} kcal\n"
+        contexto_usuario += f"Perfil físico: {profile.get('weight')}kg, {profile.get('height')}cm, Atividade: {profile.get('activity')}\n"
+    
+    contexto_usuario += f"Consumo de hoje: {stats['kcal']} kcal (P: {stats['protein']}g, C: {stats['carbs']}g, G: {stats['fat']}g)"
+
+    sys_prompt = f"""
+    Você é o 'CaloriesBot', um Nutricionista e Personal Trainer virtual super carismático e motivador.
+    
+    DADOS DO ALUNO AGORA:
+    {contexto_usuario}
+    
+    REGRAS:
+    1. Responda de forma curta, prática e amigável (estilo Telegram). Use emojis.
+    2. Use o consumo de hoje e o objetivo do aluno para dar dicas úteis.
+    3. Nunca diga que você é uma IA. Aja como um parceiro humano.
+    """
+
+    # 2. Memória da Conversa
+    if user_id not in user_history:
+        user_history[user_id] = []
+        
+    history = user_history[user_id]
+    history.append({"role": "user", "content": message.text})
+    if len(history) > 6: history = history[-6:]
+
+    messages = [{"role": "system", "content": sys_prompt}] + history
+
+    try:
+        completion = await groq_client.chat.completions.create(
+            messages=messages,
+            model="llama-3.3-70b-versatile",
+            temperature=0.7,
+        )
+        bot_reply = completion.choices[0].message.content.strip()
+        history.append({"role": "assistant", "content": bot_reply})
+        user_history[user_id] = history
+        await message.answer(bot_reply, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Erro no Nutri Chat Groq: {e}")
+        await message.answer("Eita, deu um branco aqui! Pode repetir? 😅")
 
 # --- Timezone Helpers ---
 
@@ -440,7 +506,23 @@ async def get_report_data(user_id: str, days: int):
         )
         return res.data or []
     except Exception as e:
-        logger.error(f"Erro ao buscar dados do relatório: {e}")
+        return []
+
+async def get_recent_logs(user_id: int, minutes: int = 15):
+    """Retrieves logs from the last 15 minutes to provide context for additions/corrections."""
+    try:
+        now_br = get_br_now()
+        start_time = (now_br - timedelta(minutes=minutes)).isoformat()
+        res = await async_execute(
+            supabase.table("logs")
+            .select("food, weight, kcal, protein, carbs, fat")
+            .eq("user_id", str(user_id))
+            .gte("created_at", start_time)
+            .order("created_at", desc=True)
+        )
+        return res.data or []
+    except Exception as e:
+        logger.error(f"Error fetching recent logs: {e}")
         return []
 
 async def delete_last_log(user_id: str):
@@ -454,11 +536,10 @@ async def delete_last_log(user_id: str):
             .limit(1)
         )
         if res.data:
-            created_at = res.data[0]['created_at']
             await async_execute(
                 supabase.table("logs").delete()
                 .eq("user_id", str(user_id))
-                .eq("created_at", created_at)
+                .eq("id", res.data[0]["id"])
             )
             return True
         return False
@@ -772,18 +853,27 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
 
     # 3. Model extraction with Context
     if image_bytes:
+        # Novo: Buscar contexto recente (últimos 15 min) para suportar adições como "comi mais um"
+        recent_logs = await get_recent_logs(user_id)
+        contexto_recente_str = json.dumps(recent_logs, ensure_ascii=False) if recent_logs else "Nenhum registro recente."
+
         # Use Gemini ONLY for VISION
         auto_meal = get_meal_type_by_hour()
         prompt = f"""
         Você é um nutricionista especialista com visão computacional. Analise a IMAGEM e retorne JSON.
         DADOS DE BUSCA (Se houver): {json.dumps(search_context, ensure_ascii=False)}
+        CONTEXTO RECENTE (Últimos 15 min): {contexto_recente_str}
         HORÁRIO ATUAL (Brasil): {get_br_now().strftime("%H:%M")} → refeição provável: {auto_meal}
 
-        SCHEMA: {{"is_nutrition_label": bool, "foods": [{{"alimento": str, "peso": str, "calorias": int, "proteina": float, "carboidratos": float, "gorduras": float, "refeicao": str}}], "barcode": str}}
+        SCHEMA: {{"is_nutrition_label": bool, "foods": [{{"alimento": str, "raciocinio_matematico": str, "peso": str, "calorias": int, "proteina": float, "carboidratos": float, "gorduras": float, "refeicao": str}}], "barcode": str}}
+
+        REGRAS DE CONTEXTO:
+        1. Se o "CONTEXTO RECENTE" contiver alimentos e a foto parecer ser uma ADIÇÃO ou COMPLEMENTO (ex: uma nova foto de algo que combina ou o usuário disse na legenda "mais este"), use os dados do contexto para manter a consistência.
+        2. Retorne apenas os itens que estão na FOTO ATUAL.
 
         REGRAS GERAIS:
         1. Primeiro, classifique a imagem: é uma TABELA NUTRICIONAL (rótulo) ou uma FOTO DE COMIDA?
-        2. Coloque true em "is_nutrition_label" se for um rótulo/embalagem/tabela de macros.
+        2. Coloque true in "is_nutrition_label" se for um rótulo/embalagem/tabela de macros.
 
         SE FOR TABELA NUTRICIONAL (is_nutrition_label = true):
         - Leia DIRETAMENTE os valores impressos na tabela: calorias, proteínas, carboidratos, gorduras.
@@ -878,15 +968,25 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
               * 1 fatia = 30g | 1 colher sopa = 15g | 1 xícara = 200g | 1 unidade (ovo/fruta) = 50-60g.
             """
 
+        # Novo: Buscar contexto recente (últimos 15 min) para suportar adições
+        recent_logs = await get_recent_logs(user_id)
+        contexto_recente_str = json.dumps(recent_logs, ensure_ascii=False) if recent_logs else "Nenhum registro recente."
+
         # Use Groq for TEXT extraction + scaling
         if not groq_client: return [], None, "Groq client not init", None
 
         prompt = f"""
         Você é um nutricionista especialista. Extraia os alimentos e seus macros do texto usuario.
         USE OS DADOS DE BUSCA ABAIXO COMO REFERÊNCIA DE CALORIAS E PORÇÕES.
+        CONTEXTO RECENTE (Últimos 15 min): {contexto_recente_str}
         
-        DADOS DE BUSCA: {json.dumps(search_context, ensure_ascii=False)}
         TEXTO DO USUÁRIO: "{message_text}"
+
+        REGRAS DE CONTEXTO (IMPORTANTE):
+        1. Se o TEXTO DO USUÁRIO for uma ADIÇÃO ou CORREÇÃO (ex: "mais um", "na verdade foram 2", "esqueci da coca"), use o CONTEXTO RECENTE para identificar qual alimento ele está complementando.
+        2. Retorne APENAS os itens NOVOS que precisam ser adicionados ao log para que o total final esteja correto. 
+           Ex: Se o contexto diz "1 pão" e o usuário diz "comi mais um", retorne apenas "1 pão" no JSON.
+        3. Se não houver relação clara com o contexto recente, ignore-o e trate como um novo registro.
 
         REGRAS MATEMÁTICAS RÍGIDAS:
         1. Identifique a quantidade consumida.
@@ -1622,6 +1722,42 @@ async def process_food_entry(message: types.Message, items: list, raw_data: str,
     )
     await message.answer(response_text, parse_mode="Markdown", reply_markup=kb)
 
+async def _handle_extraction_result(
+    message: types.Message,
+    state: FSMContext,
+    items,
+    error_type,
+    raw_data,
+    original_text: str,
+    user_id: int,
+    user_name: str,
+):
+    if error_type == "needs_choice":
+        data = json.loads(raw_data)
+        candidates = data.get("candidates", [])
+        source = data.get("source", "fatsecret")
+        kb = InlineKeyboardMarkup(inline_keyboard=[])
+        for idx, c in enumerate(candidates):
+            btn_text = f"{smart_truncate(c['alimento'], 28).capitalize()} ({int(c['calorias'])}kcal/{c['peso']})"
+            if len(btn_text) > 40: btn_text = btn_text[:37] + "..."
+            kb.inline_keyboard.append([InlineKeyboardButton(text=btn_text, callback_data=f"fsc_{idx}")])
+        kb.inline_keyboard.append([InlineKeyboardButton(text="❌ Nenhuma destas", callback_data="fsc_none")])
+        await state.update_data(fs_candidates=candidates, original_text=original_text, choice_source=source)
+        if source == "catalog":
+            await message.answer("✅ **Encontrei no nosso banco verificado.** Qual se aproxima mais do que você consumiu?", reply_markup=kb, parse_mode="Markdown")
+        else:
+            await message.answer("🔍 **Encontrei opções globais.** Qual se aproxima mais do que você consumiu?", reply_markup=kb, parse_mode="Markdown")
+        await state.set_state(FatSecretState.waiting_for_choice)
+        return
+    elif error_type:
+        await message.answer("❌ Erro na extração a partir do texto. Tente novamente.")
+        return
+    if items is not None and len(items) == 0:
+        message_copy = message.model_copy(update={"text": original_text})
+        await handle_nutri_chat(message_copy, user_id)
+        return
+    await process_food_entry(message, items, raw_data, user_id, user_name)
+
 @dp.message(F.photo)
 async def handle_photo(message: types.Message, state: FSMContext):
     if await state.get_state(): await state.clear()
@@ -1665,15 +1801,73 @@ async def handle_photo(message: types.Message, state: FSMContext):
         logger.error(f"Erro no handle_photo: {e}")
         await message.answer("❌ Ocorreu um erro inesperado ao processar a foto.")
 
+@dp.message(F.voice)
+async def handle_voice(message: types.Message, state: FSMContext):
+    """Lida com mensagens de áudio, transcreve com Whisper e processa como texto."""
+    if await state.get_state(): await state.clear()
+    global user_history
+
+    try:
+        msg_id = f"{message.chat.id}:{message.message_id}"
+        now_ts = time.time()
+        expired_keys = [k for k, v in processed_messages.items() if now_ts - v > 300]
+        for k in expired_keys:
+            del processed_messages[k]
+        if msg_id in processed_messages: return
+        processed_messages[msg_id] = now_ts
+
+        status_msg = await message.answer("Ouvindo seu áudio... 🎧")
+        user_id = message.from_user.id
+
+        # 1. Baixar o arquivo de áudio do Telegram
+        voice_file = await bot.get_file(message.voice.file_id)
+        audio_bytes = io.BytesIO()
+        await bot.download_file(voice_file.file_path, destination=audio_bytes)
+        audio_bytes.name = "voice.ogg"  # A API do Groq exige um nome de arquivo
+
+        # 2. Enviar para a API Whisper da Groq
+        transcription = await groq_client.audio.transcriptions.create(
+            file=(audio_bytes.name, audio_bytes.getvalue()),
+            model="whisper-large-v3",
+            prompt="O usuário está ditando alimentos que comeu ou fazendo perguntas para seu nutricionista virtual.",
+            language="pt",
+            response_format="json"
+        )
+
+        user_text = transcription.text
+        if not user_text or len(user_text.strip()) < 2:
+            await status_msg.edit_text("❌ Não consegui ouvir nada no áudio. Pode tentar de novo?")
+            return
+
+        # Atualiza a mensagem para mostrar o que o bot ouviu
+        await status_msg.edit_text(f"🗣️ **Você disse:** _{user_text}_\n\nCalculando... 🧐", parse_mode="Markdown")
+
+        # 3. Reutiliza exatamente a mesma lógica de texto!
+        items, barcode, error_type, raw_data = await extract_calories_list(
+            user_id=user_id, 
+            message_text=user_text
+        )
+        
+        await status_msg.delete()
+
+        await _handle_extraction_result(message, state, items, error_type, raw_data, user_text, user_id, message.from_user.full_name)
+
+    except Exception as e:
+        logger.error(f"Erro no handle_voice: {e}")
+        await message.answer("❌ Ocorreu um erro inesperado ao processar seu áudio.")
+
 @dp.message(F.text)
 async def handle_text(message: types.Message, state: FSMContext):
     if await state.get_state(): await state.clear()
     global user_history
     try:
         msg_id = f"{message.chat.id}:{message.message_id}"
+        now_ts = time.time()
+        expired_keys = [k for k, v in processed_messages.items() if now_ts - v > 300]
+        for k in expired_keys:
+            del processed_messages[k]
         if msg_id in processed_messages: return
-        processed_messages.add(msg_id)
-        if len(processed_messages) > 1000: processed_messages.clear()
+        processed_messages[msg_id] = now_ts
 
         status_msg = await message.answer("Calculando... 🧐")
         
@@ -1703,36 +1897,7 @@ async def handle_text(message: types.Message, state: FSMContext):
         )
         
         await status_msg.delete()
-        if error_type == "needs_choice":
-            data = json.loads(raw_data)
-            candidates = data.get("candidates", [])
-            source = data.get("source", "fatsecret")
-            
-            kb = InlineKeyboardMarkup(inline_keyboard=[])
-            for idx, c in enumerate(candidates):
-                btn_text = f"{smart_truncate(c['alimento'], 28).capitalize()} ({int(c['calorias'])}kcal/{c['peso']})"
-                if len(btn_text) > 40: btn_text = btn_text[:37] + "..."
-                kb.inline_keyboard.append([InlineKeyboardButton(text=btn_text, callback_data=f"fsc_{idx}")])
-            
-            kb.inline_keyboard.append([InlineKeyboardButton(text="❌ Nenhuma destas", callback_data="fsc_none")])
-            
-            await state.update_data(fs_candidates=candidates, original_text=message.text, choice_source=source)
-            if source == "catalog":
-                await message.answer("✅ **Encontrei no nosso banco verificado.** Qual se aproxima mais do que você consumiu?", reply_markup=kb, parse_mode="Markdown")
-            else:
-                await message.answer("🔍 **Encontrei opções globais.** Qual se aproxima mais do que você consumiu?", reply_markup=kb, parse_mode="Markdown")
-            await state.set_state(FatSecretState.waiting_for_choice)
-            return
-            
-        elif error_type:
-            await message.answer(f"❌ Erro na extração a partir do texto. Tente novamente.")
-            return
-            
-        if items is not None and len(items) == 0:
-            await message.answer("🤔 Não identifiquei alimentos. Pode ser mais específico?")
-            return
-
-        await process_food_entry(message, items, raw_data, user_id, message.from_user.full_name)
+        await _handle_extraction_result(message, state, items, error_type, raw_data, message.text, user_id, message.from_user.full_name)
     except Exception as e:
         logger.error(f"Erro no handle_text: {e}")
         await message.answer("❌ Ocorreu um erro inesperado.")
@@ -1836,7 +2001,7 @@ async def process_fs_choice(callback: types.CallbackQuery, state: FSMContext):
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
     update = Update.model_validate(await request.json(), context={"bot": bot})
-    await dp.feed_update(bot, update)
+    asyncio.create_task(dp.feed_update(bot, update))
     return {"status": "ok"}
 
 @app.get("/")
@@ -1844,17 +2009,6 @@ def index(): return {"status": "CaloriesBot is running"}
 
 @app.api_route("/api/health", methods=["GET", "POST", "HEAD"])
 def health_check(): return {"status": "ok"}
-
-@app.on_event("startup")
-async def on_startup():
-    await bot.set_webhook(url=f"{WEBHOOK_URL}/webhook")
-    logger.info(f"Webhook set to {WEBHOOK_URL}/webhook")
-    asyncio.create_task(reminder_loop())
-
-@app.on_event("shutdown")
-async def on_shutdown():
-    await http_client.aclose()
-    logger.info("HTTP client closed.")
 
 async def reminder_loop():
     """Background task to send reminders to inactive users."""

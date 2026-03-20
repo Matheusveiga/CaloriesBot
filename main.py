@@ -695,6 +695,7 @@ async def generate_surgical_query(text: str) -> List[Dict[str, str]]:
             # If the model returned {"items": [...]}, {"foods": [...]}, or just one item dictionary
             if "items" in data: items = data["items"]
             elif "foods" in data: items = data["foods"]
+            elif "alimentos" in data: items = data["alimentos"]
             elif "pt" in data: items = [data]
             else: items = [data] # Fallback
         elif isinstance(data, list):
@@ -841,6 +842,7 @@ async def is_food_message(text: str) -> bool:
 
 async def extract_calories_list(user_id: int, message_text: str = "", image_bytes: bytes = None, fs_chosen_candidate: dict = None):
     all_items_queries = []
+    search_context = []
     
     if message_text and not image_bytes:
         all_items_queries = await generate_surgical_query(message_text)

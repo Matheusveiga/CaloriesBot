@@ -7,6 +7,7 @@ import asyncio
 import logging
 import time
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from typing import Dict, Any, List, Optional
 
 import matplotlib.pyplot as plt
@@ -15,7 +16,7 @@ matplotlib.use('Agg')
 
 from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command, StateFilter
+from aiogram.filters import Command
 from aiogram.types import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.storage.base import BaseStorage, StorageKey, StateType
 from aiogram.fsm.context import FSMContext
@@ -71,6 +72,7 @@ if GROQ_API_KEY:
 # Constants
 AI_MODEL = "gemini-2.0-flash"
 AI_MODEL_FALLBACK = "gemini-1.5-flash"
+_BR_TZ = ZoneInfo("America/Sao_Paulo")
 
 # States
 class ProfileStates(StatesGroup):
@@ -87,6 +89,9 @@ class BarcodeState(StatesGroup):
 class CorrectionStates(StatesGroup):
     kcal = State()
 
+class DeleteFoodState(StatesGroup):
+    waiting_for_choice = State()
+
 class FatSecretState(StatesGroup):
     waiting_for_choice = State()
 
@@ -94,7 +99,6 @@ class FatSecretState(StatesGroup):
 processed_messages = set()
 fs_token = {"access_token": None, "expires_at": 0}
 fs_lock = asyncio.Lock()
-AI_CACHE = {}
 user_history = {}
 jailbreak_users = {}
 
@@ -164,12 +168,28 @@ async def generate_sarcastic_response(user_id: int, message_text: str):
 
 def get_br_now():
     """Returns the current datetime in Brazil (America/Sao_Paulo)."""
-    from zoneinfo import ZoneInfo
-    return datetime.now(ZoneInfo("America/Sao_Paulo"))
+    return datetime.now(_BR_TZ)
 
 def get_br_today_start():
-    """Returns the start of today in Brazil (00:00:00) in ISO format with offset."""
-    return get_br_now().strftime("%Y-%m-%dT00:00:00-03:00")
+    """Returns the start of today in Brazil in ISO format with correct UTC offset."""
+    now = get_br_now()
+    return now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+
+def get_meal_type_by_hour() -> str:
+    """Classifies the current meal type based on Brazil local time."""
+    hour = get_br_now().hour
+    if 5 <= hour < 9:
+        return "Café da manhã"
+    elif 9 <= hour < 11:
+        return "Lanche da manhã"
+    elif 11 <= hour < 15:
+        return "Almoço"
+    elif 15 <= hour < 18:
+        return "Lanche da tarde"
+    elif 18 <= hour < 21:
+        return "Jantar"
+    else:
+        return "Ceia"
 
 def parse_numeric(text: str) -> Optional[float]:
     """Robust parser for numeric inputs like '75,5', '175cm', '80kg'."""
@@ -180,6 +200,19 @@ def parse_numeric(text: str) -> Optional[float]:
         try: return float(match.group(1))
         except: return None
     return None
+
+def smart_truncate(name: str, max_len: int = 40) -> str:
+    """Trunca nomes longos preservando palavras inteiras. Usado em botões e no catálogo."""
+    if not name or len(name) <= max_len:
+        return name
+    words = name.split()
+    result = words[0]
+    for w in words[1:]:
+        if len(result) + 1 + len(w) <= max_len - 3:
+            result += " " + w
+        else:
+            break
+    return result + "..."
 
 # --- DB Logic ---
 
@@ -267,7 +300,8 @@ async def save_to_universal_catalog(item: dict):
     """Saves a verified food item to the catalog to prevent redundant AI calls."""
     try:
         food_name = item.get("alimento")
-        check = supabase.table("universal_catalog").select("id").eq("food", food_name).limit(1).execute()
+        food_name = smart_truncate(food_name, max_len=80)  # Garante nomes razoáveis no catálogo
+        check = await async_execute(supabase.table("universal_catalog").select("id").eq("food", food_name).limit(1))
         if check.data:
             return True
             
@@ -376,7 +410,7 @@ async def get_daily_stats(user_id: str):
             
         total_kcal = sum(item.get('kcal', 0) for item in response.data)
         total_prot = sum(item.get('protein', 0) for item in response.data)
-        total_carb = sum(item.get('carboidratos', 0) for item in response.data)
+        total_carb = sum(item.get('carbs', 0) for item in response.data)
         total_fat = sum(item.get('fat', 0) for item in response.data)
         
         return {
@@ -700,7 +734,7 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
             
             emb = await get_embedding(clean_name_pt)
             if emb or clean_name_pt:
-                match = await search_universal_catalog(query_embedding=emb, threshold=0.75, keyword=clean_name_pt)
+                match = await search_universal_catalog(query_embedding=emb, threshold=0.88, keyword=clean_name_pt)
                 if match:
                     if len(match) > 1:
                         logger.info("Multiple Catalog candidates found. Requesting user choice.")
@@ -729,18 +763,33 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
     # 3. Model extraction with Context
     if image_bytes:
         # Use Gemini ONLY for VISION
+        auto_meal = get_meal_type_by_hour()
         prompt = f"""
-        Você é um nutricionista especialista. Analise a IMAGEM e retorne JSON.
+        Você é um nutricionista especialista com visão computacional. Analise a IMAGEM e retorne JSON.
         DADOS DE BUSCA (Se houver): {json.dumps(search_context, ensure_ascii=False)}
-        
-        SCHEMA: {{"foods": [{{"alimento": str, "peso": str, "calorias": int, "proteina": float, "carboidratos": float, "gorduras": float, "refeicao": str}}], "barcode": str}}
-        
-        REGRAS: 
-        1. Se houver dados de busca compatíveis, USE-OS como base para os macros.
-        2. Olhe a chave "peso" dos dados de busca.
-        3. Se for "100g", estime o peso da comida na foto em gramas e faça Regra de Três.
-        4. Se for "1 unidade" (lanche/fast food), apenas CONTE quantos lanches tem na foto e multiplique diretamente.
-        5. Se não houver dados de busca, use sua melhor estimativa.
+        HORÁRIO ATUAL (Brasil): {get_br_now().strftime("%H:%M")} → refeição provável: {auto_meal}
+
+        SCHEMA: {{"is_nutrition_label": bool, "foods": [{{"alimento": str, "peso": str, "calorias": int, "proteina": float, "carboidratos": float, "gorduras": float, "refeicao": str}}], "barcode": str}}
+
+        REGRAS GERAIS:
+        1. Primeiro, classifique a imagem: é uma TABELA NUTRICIONAL (rótulo) ou uma FOTO DE COMIDA?
+        2. Coloque true em "is_nutrition_label" se for um rótulo/embalagem/tabela de macros.
+
+        SE FOR TABELA NUTRICIONAL (is_nutrition_label = true):
+        - Leia DIRETAMENTE os valores impressos na tabela: calorias, proteínas, carboidratos, gorduras.
+        - Use a porção descrita na tabela como "peso" (ex: "30g", "1 sachê").
+        - Ignore qualquer dado de busca; os valores da tabela são exatos.
+        - is_precise deve ser true.
+
+        SE FOR FOTO DE COMIDA (is_nutrition_label = false):
+        - Se houver dados de busca compatíveis, USE-OS como base para os macros.
+        - Olhe a chave "peso" dos dados de busca.
+        - Se for "100g", estime o peso da comida na foto e faça Regra de Três.
+        - Se for "1 unidade" (lanche/fast food), apenas CONTE e multiplique.
+        - Se não houver dados de busca, use sua melhor estimativa.
+
+        REFEIÇÃO: Use o horário atual para classificar a refeição. Padrão automático: "{auto_meal}".
+        Se o usuário informou o tipo no texto da legenda, priorize o que ele disse.
         """
         contents = [prompt]
         if message_text: contents.append(message_text)
@@ -754,7 +803,17 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
             raw_text = res.text
             logger.info(f"Gemini Vision Raw Response: {raw_text}")
             data = json.loads(raw_text)
-            return data.get("foods", []), data.get("barcode"), None, raw_text
+            is_label = data.get("is_nutrition_label", False)
+            foods = data.get("foods", [])
+            if is_label:
+                logger.info("🏷️ Tabela nutricional detectada — lendo macros direto do rótulo.")
+                for f in foods:
+                    f["is_precise"] = True
+            # Apply time-based meal type as fallback
+            for f in foods:
+                if not f.get("refeicao") or f.get("refeicao") in ("", "Outro", "outro"):
+                    f["refeicao"] = auto_meal
+            return foods, data.get("barcode"), None, raw_text
         except Exception as e:
             logger.error(f"Gemini Vision Error: {e}")
             return [], None, str(e), None
@@ -798,6 +857,11 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
             logger.info(f"Groq Unified Extraction Response: {raw_data}")
             parsed = json.loads(raw_data)
             foods = parsed.get("itens") or parsed.get("foods") or []
+            # Apply time-based meal type as fallback
+            auto_meal = get_meal_type_by_hour()
+            for f in foods:
+                if not f.get("refeicao") or f.get("refeicao") in ("", "Outro", "outro"):
+                    f["refeicao"] = auto_meal
             return foods, None, None, raw_data
         except Exception as e:
             logger.error(f"Groq Unified Extraction Error: {e}")
@@ -899,12 +963,6 @@ async def get_barcode_data(barcode: str):
             logger.error(f"Erro ao buscar OpenFoodFacts: {e}")
     return None
 
-# Logic consolidated above
-
-# --- Mifflin-St Jeor ---
-
-# calculate_tdee already defined above
-
 # --- Bot Handlers ---
 
 @dp.message(Command("start"))
@@ -967,7 +1025,7 @@ async def cmd_reset_day(message: types.Message):
     else:
         await message.answer("❌ Erro ao apagar logs de hoje.")
 
-@dp.message(Command("reset_perfil"))
+@dp.message(Command("reset_perfil", "resetperfil"))
 async def cmd_reset_profile(message: types.Message, state: FSMContext):
     if await delete_entire_profile(message.from_user.id):
         if message.from_user.id in user_history:
@@ -989,7 +1047,7 @@ async def cmd_status(message: types.Message):
         await message.answer("⚠️ Você ainda não configurou seu perfil. Use /start para começar!")
         return
         
-    daily_limit = profile['tdee']
+    daily_limit = profile.get('tdee', 2000)
     daily_total = await get_daily_total(user_id)
     remaining = daily_limit - daily_total
     
@@ -1026,7 +1084,80 @@ async def cmd_status(message: types.Message):
     else:
         status_msg += "🟢 No caminho certo!"
 
-    await message.answer(status_msg, parse_mode="Markdown")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑️ Apagar alimento", callback_data="show_delete_list")]
+    ])
+    await message.answer(status_msg, parse_mode="Markdown", reply_markup=kb)
+
+@dp.callback_query(F.data == "show_delete_list")
+async def show_delete_list(callback: types.CallbackQuery, state: FSMContext):
+    """Shows today's food list so the user can pick one to delete."""
+    user_id = callback.from_user.id
+    today_br_start = get_br_today_start()
+    res = await async_execute(
+        supabase.table("logs")
+        .select("id, food, weight, kcal, meal_type")
+        .eq("user_id", str(user_id))
+        .gte("created_at", today_br_start)
+        .order("created_at", desc=True)
+    )
+    logs = res.data or []
+    if not logs:
+        await callback.answer("Nenhum alimento registrado hoje.", show_alert=True)
+        return
+
+    buttons = []
+    for entry in logs:
+        label = f"{smart_truncate(entry.get('food','?'), 30)} ({entry.get('weight','?')}) — {entry.get('kcal',0)} kcal"
+        if len(label) > 64: label = label[:61] + "..."
+        buttons.append([InlineKeyboardButton(text=label, callback_data=f"del_item_{entry['id']}")])
+    buttons.append([InlineKeyboardButton(text="🔙 Cancelar", callback_data="del_cancel")])
+
+    await callback.message.edit_text(
+        "🗑️ **Qual alimento deseja apagar?**\nSelecione na lista abaixo:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+    await state.set_state(DeleteFoodState.waiting_for_choice)
+    await callback.answer()
+
+@dp.callback_query(DeleteFoodState.waiting_for_choice, F.data.startswith("del_item_"))
+async def process_delete_item(callback: types.CallbackQuery, state: FSMContext):
+    """Deletes the selected food entry by its database id."""
+    entry_id = callback.data.replace("del_item_", "")
+    user_id = callback.from_user.id
+    try:
+        entry_id_int = int(entry_id)  # logs.id é bigint — valida que é inteiro positivo
+        if entry_id_int <= 0:
+            raise ValueError()
+    except ValueError:
+        await callback.answer("❌ ID inválido.", show_alert=True)
+        return
+    try:
+        res = await async_execute(
+            supabase.table("logs").select("food, kcal").eq("id", entry_id).eq("user_id", str(user_id))
+        )
+        item_name = res.data[0].get("food", "item") if res.data else "item"
+        item_kcal = res.data[0].get("kcal", 0) if res.data else 0
+
+        await async_execute(
+            supabase.table("logs").delete().eq("id", entry_id).eq("user_id", str(user_id))
+        )
+        await state.clear()
+        await callback.answer()
+        await callback.message.edit_text(
+            f"✅ **{item_name}** ({item_kcal} kcal) removido com sucesso!\n\nUse /status para ver o total atualizado.",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"Erro ao deletar item {entry_id}: {e}")
+        await callback.answer("❌ Erro ao remover o alimento.", show_alert=True)
+
+@dp.callback_query(F.data == "del_cancel")
+async def cancel_delete(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("Operação cancelada.")
+    await callback.answer()
 
 @dp.callback_query(F.data.startswith("adj_"))
 async def process_adjustment(callback: types.CallbackQuery):
@@ -1035,14 +1166,13 @@ async def process_adjustment(callback: types.CallbackQuery):
     action = callback.data.split("_")[1] # 1.1, 0.9, undo
     
     try:
-        # Get the latest entry timestamp for this user
         res = await async_execute(
-        supabase.table("logs")
-        .select("created_at")
-        .eq("user_id", str(user_id))
-        .order("created_at", desc=True)
-        .limit(1)
-    )
+            supabase.table("logs")
+            .select("created_at")
+            .eq("user_id", str(user_id))
+            .order("created_at", desc=True)
+            .limit(1)
+        )
         
         if not res.data:
             await callback.answer("❌ Nenhum log recente encontrado.")
@@ -1057,27 +1187,24 @@ async def process_adjustment(callback: types.CallbackQuery):
                 await callback.answer("❌ Erro ao desfazer.")
             return
 
-        # Numeric adjustment
         multiplier = float(action)
         
-        # Update kcal and macros in the DB using RPC or direct update
-        # For simplicity, we update all entries at that exact timestamp
         logs_to_update = await async_execute(
-        supabase.table("logs")
-        .select("*")
-        .eq("user_id", str(user_id))
-        .eq("created_at", last_time)
-    )
+            supabase.table("logs")
+            .select("*")
+            .eq("user_id", str(user_id))
+            .eq("created_at", last_time)
+        )
 
         for entry in logs_to_update.data:
             await async_execute(
-        supabase.table("logs").update({
-            "kcal": round(entry['kcal'] * multiplier),
-            "protein": round(entry['protein'] * multiplier),
-            "carbs": round(entry['carbs'] * multiplier),
-            "fat": round(entry['fat'] * multiplier)
-        }).eq("id", entry['id'])
-    )
+                supabase.table("logs").update({
+                    "kcal": round(entry['kcal'] * multiplier),
+                    "protein": round(entry['protein'] * multiplier),
+                    "carbs": round(entry['carbs'] * multiplier),
+                    "fat": round(entry['fat'] * multiplier)
+                }).eq("id", entry['id'])
+            )
 
         pct = "+10%" if multiplier > 1 else "-10%"
         await callback.message.edit_text(f"✅ Ajustado em **{pct}**! Use /status para ver o novo total.", parse_mode="Markdown")
@@ -1118,11 +1245,11 @@ async def process_manual_kcal(message: types.Message, state: FSMContext):
         new_kcal = round((kcal_100g / 100) * weight)
         
         await async_execute(
-        supabase.table("logs").update({
-            "kcal": new_kcal,
-            "is_precise": True
-        }).eq("id", entry['id'])
-    )
+            supabase.table("logs").update({
+                "kcal": new_kcal,
+                "is_precise": True
+            }).eq("id", entry['id'])
+        )
         
         await message.answer(f"✅ Corrigido para **{new_kcal} kcal** ({kcal_100g} kcal/100g)!", parse_mode="Markdown")
     
@@ -1263,7 +1390,7 @@ async def process_barcode_portion(message: types.Message, state: FSMContext):
         "proteina": round(product["prot_100g"] * factor),
         "carboidratos": round(product["carb_100g"] * factor),
         "gorduras": round(product["fat_100g"] * factor),
-        "refeicao": "Lanche", # Default para scanner, process_food_entry ajusta se necessário
+        "refeicao": get_meal_type_by_hour(),
         "is_precise": True
     }
 
@@ -1318,7 +1445,11 @@ async def process_report(callback: types.CallbackQuery):
         data = await get_report_data(callback.from_user.id, days)
         profile = await get_user_profile(callback.from_user.id)
         
-        tdee = profile['tdee'] if profile else 2000
+        if profile and 'tdee' in profile:
+            tdee = profile['tdee']
+        else:
+            logger.warning(f"Perfil sem TDEE para usuário {callback.from_user.id} no relatório. Usando fallback.")
+            tdee = 2000
         total_kcal = sum(d.get('kcal', 0) for d in data)
         total_prot = sum(d.get('protein', 0) for d in data)
         total_carb = sum(d.get('carbs', 0) for d in data)
@@ -1359,9 +1490,6 @@ async def process_report(callback: types.CallbackQuery):
 
 # --- Food and Vision Handling ---
 
-
-# --- Food and Vision Handling ---
-
 async def process_food_entry(message: types.Message, items: list, raw_data: str):
     """Common logic for saving and responding to food entries."""
     if not items:
@@ -1374,7 +1502,11 @@ async def process_food_entry(message: types.Message, items: list, raw_data: str)
     
     stats = await get_daily_stats(message.from_user.id)
     profile = await get_user_profile(message.from_user.id)
-    daily_limit = profile['tdee'] if profile else 2000
+    if profile and 'tdee' in profile:
+        daily_limit = profile['tdee']
+    else:
+        logger.warning(f"Perfil não encontrado ou sem TDEE para usuário {message.from_user.id} no momento do registro. Usando fallback.")
+        daily_limit = 2000
     daily_total = stats["kcal"]
     remaining = daily_limit - daily_total
     
@@ -1498,11 +1630,6 @@ async def handle_text(message: types.Message, state: FSMContext):
             await message.answer("Eae amigão, ta tentando mandar um Jailbreak para CaloriesBot? Não vai conseguir.")
             return
 
-        if len(message.text.split()) <= 3:
-            db_match = await search_food_history(user_id, message.text.strip())
-            if db_match and db_match[0].get("is_approximate"):
-                pass
-
         items, barcode, error_type, raw_data = await extract_calories_list(
             user_id=user_id, 
             message_text=message.text
@@ -1516,7 +1643,7 @@ async def handle_text(message: types.Message, state: FSMContext):
             
             kb = InlineKeyboardMarkup(inline_keyboard=[])
             for idx, c in enumerate(candidates):
-                btn_text = f"{c['alimento'].capitalize()} ({int(c['calorias'])}kcal/{c['peso']})"
+                btn_text = f"{smart_truncate(c['alimento'], 28).capitalize()} ({int(c['calorias'])}kcal/{c['peso']})"
                 if len(btn_text) > 40: btn_text = btn_text[:37] + "..."
                 kb.inline_keyboard.append([InlineKeyboardButton(text=btn_text, callback_data=f"fsc_{idx}")])
             
@@ -1669,17 +1796,26 @@ async def reminder_loop():
         try:
             now_br = get_br_now()
             hour = now_br.hour
-            if 10 <= hour <= 22:
+            if hour in [11, 16, 20]:
                 res = await async_execute(supabase.table("profiles").select("user_id"))
                 users = res.data or []
                 today_start = get_br_today_start()
+                # 1 query para buscar todos que já registraram hoje (evita N+1)
+                logged_res = await async_execute(
+                    supabase.table("logs")
+                    .select("user_id")
+                    .gte("created_at", today_start)
+                )
+                logged_users = {row["user_id"] for row in (logged_res.data or [])}
+                msg = "🔔 Registro pendente! Vamos focar na dieta? 💪🍎"
                 for user in users:
                     uid = user['user_id']
-                    log_res = await async_execute(supabase.table("logs").select("id").eq("user_id", str(uid)).gte("created_at", today_start).limit(1))
-                    if not log_res.data and hour in [11, 16, 20]:
-                        msg = "🔔 Registro pendente! Vamos focar na dieta? 💪🍎"
-                        await bot.send_message(uid, msg, parse_mode="Markdown")
-            await asyncio.sleep(3600) 
+                    if str(uid) not in logged_users:
+                        try:
+                            await bot.send_message(uid, msg)
+                        except Exception as send_err:
+                            logger.warning(f"Não foi possível enviar lembrete para {uid}: {send_err}")
+            await asyncio.sleep(3600)
         except Exception as e:
             logger.error(f"Erro reminder loop: {e}")
             await asyncio.sleep(300)

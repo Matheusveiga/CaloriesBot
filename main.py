@@ -43,7 +43,7 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 FATSECRET_CLIENT_ID = os.getenv("FATSECRET_CLIENT_ID")
 FATSECRET_CLIENT_SECRET = os.getenv("FATSECRET_CLIENT_SECRET")
-FATSECRET_PROXIES = [p.strip() for p in os.getenv("FATSECRET_PROXIES", "").split(",") if p.strip()]
+FATSECRET_PROXIES_STR = os.getenv("FATSECRET_PROXIES", "")
 WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL")
 
 # Init Clients
@@ -67,13 +67,14 @@ supabase.postgrest.auth(SUPABASE_KEY)
 # Custom HTTP Client for general use
 http_client = httpx.AsyncClient(timeout=httpx.Timeout(15.0), follow_redirects=True)
 
-# FatSecret Proxy Rotation
-_fs_proxy_cycle = itertools.cycle(FATSECRET_PROXIES) if FATSECRET_PROXIES else None
-
+# FatSecret Proxy Rotation (lazy-load para reduzir exposição em memória)
 def get_fs_client():
-    if not _fs_proxy_cycle:
+    if not FATSECRET_PROXIES_STR:
         return http_client
-    proxy_url = next(_fs_proxy_cycle)
+    proxies = [p.strip() for p in FATSECRET_PROXIES_STR.split(",") if p.strip()]
+    if not proxies:
+        return http_client
+    proxy_url = proxies[int(time.time()) % len(proxies)]
     return httpx.AsyncClient(proxy=proxy_url, timeout=httpx.Timeout(15.0))
 
 groq_client = None
@@ -112,28 +113,53 @@ fs_token = {"access_token": None, "expires_at": 0}
 fs_lock = asyncio.Lock()
 user_history = {}
 jailbreak_users = {}
+user_rate_limit: dict = {}  # {user_id: {"count": N, "reset_at": timestamp}}
+MAX_REQUESTS_PER_MINUTE = 10
 
 # --- Security Logic ---
+
+def check_rate_limit(user_id: int) -> bool:
+    """Retorna True se dentro do limite, False se excedeu 10 req/min."""
+    now = time.time()
+    if user_id not in user_rate_limit:
+        user_rate_limit[user_id] = {"count": 1, "reset_at": now + 60}
+        return True
+    record = user_rate_limit[user_id]
+    if now > record["reset_at"]:
+        record["count"] = 1
+        record["reset_at"] = now + 60
+        return True
+    if record["count"] >= MAX_REQUESTS_PER_MINUTE:
+        return False
+    record["count"] += 1
+    return True
 
 def is_jailbreak(text: str) -> bool:
     if not text: return False
     text_lower = text.lower()
-    
+
     patterns = [
-        r"plane crashed.*snow forest", # Survivors
-        r"do anything now", # DAN
-        r"hacxgpt",
-        r"evil-bot",
-        r"developer mode.*enabled",
-        r"ignore all.*instructions",
-        r"system message",
+        r"crashed.{0,20}forest",
+        r"anything.{0,10}now",
+        r"hacx",
+        r"evil.{0,5}bot",
+        r"developer.{0,5}mode",
+        r"ignore.{0,10}instruction",
+        r"system.{0,10}message",
         r"jailbreak",
         r"caloriesbot"
     ]
-    
+
     for p in patterns:
         if re.search(p, text_lower):
             return True
+
+    # Heurística: mensagem longa com múltiplas palavras suspeitas
+    suspicious_words = ["bypass", "override", "ignore", "system", "prompt", "instruction", "jailbreak"]
+    count = sum(1 for w in suspicious_words if w in text_lower)
+    if count >= 3 and len(text) > 200:
+        return True
+
     return False
 
 def is_apology(text: str) -> bool:
@@ -466,6 +492,10 @@ async def get_user_profile(user_id: str):
 async def get_daily_stats(user_id: str):
     """Calculates total calories and macros for the current day."""
     try:
+        user_id = int(user_id)
+    except (ValueError, TypeError):
+        logger.error("get_daily_stats: user_id inválido.")
+        return {"kcal": 0, "protein": 0, "carbs": 0, "fat": 0}
         today_br_start = get_br_today_start()
         response = await async_execute(
             supabase.table("logs")
@@ -510,6 +540,11 @@ async def get_report_data(user_id: str, days: int):
 
 async def get_recent_logs(user_id: int, minutes: int = 15):
     """Retrieves logs from the last 15 minutes to provide context for additions/corrections."""
+    try:
+        user_id = int(user_id)
+    except (ValueError, TypeError):
+        logger.error("get_recent_logs: user_id inválido.")
+        return []
     try:
         now_br = get_br_now()
         start_time = (now_br - timedelta(minutes=minutes)).isoformat()
@@ -574,6 +609,11 @@ async def delete_entire_profile(user_id: str):
 async def search_food_history(user_id: str, food_query: str):
     """Searches for a historical log entry (Personal -> Universal Fallback)."""
     try:
+        user_id = int(user_id)
+    except (ValueError, TypeError):
+        logger.error("search_food_history: user_id inválido.")
+        return None
+    try:
         # Pessoal Exato
         res = await async_execute(
             supabase.table("logs")
@@ -624,7 +664,7 @@ async def get_embedding(text: str):
             contents=text,
             config={'output_dimensionality': 768}
         )
-        logger.info(f"Embedding generated for text: '{text[:50]}...'")
+        logger.debug("Embedding gerado com sucesso.")
         return res.embeddings[0].values
     except Exception as e:
         logger.error(f"Erro embedding: {e}")
@@ -687,21 +727,25 @@ async def generate_surgical_query(text: str) -> List[Dict[str, str]]:
             temperature=0,
         )
         raw_data = completion.choices[0].message.content
-        logger.info(f"Groq Surgical Query Response: {raw_data}")
+        logger.debug("Groq Surgical Query concluído.")
         data = json.loads(raw_data)
         
-        # Ensure we return a list of dicts
+        # Garante que retornamos lista de dicts
         if isinstance(data, dict):
-            # If the model returned {"items": [...]}, {"foods": [...]}, or just one item dictionary
             if "items" in data: items = data["items"]
             elif "foods" in data: items = data["foods"]
             elif "alimentos" in data: items = data["alimentos"]
             elif "pt" in data: items = [data]
-            else: items = [data] # Fallback
+            else: items = [data]
         elif isinstance(data, list):
             items = data
         else:
-            items = [{"pt": text, "en_spec": text, "en_gen": text}]
+            items = []
+
+        # Validação: garante lista de dicts com ao menos "pt"
+        if not isinstance(items, list):
+            items = [items] if isinstance(items, dict) else []
+        items = [i for i in items if isinstance(i, dict) and i.get("pt")]
 
         return items if items else [{"pt": text, "en_spec": text, "en_gen": text}]
 
@@ -741,7 +785,7 @@ async def search_fatsecret(queries: dict):
             if not foods_data: continue
             if isinstance(foods_data, dict): foods_data = [foods_data]
             
-            logger.info(f"FatSecret Searching with '{search_term}' ({search_key}). Results: {len(foods_data)}")
+            logger.debug(f"FatSecret: {len(foods_data)} resultado(s) para a chave '{search_key}'.")
 
             selection_prompt = f"""
             Quais desses alimentos são os MELHORES matches para o pedido original: "{queries.get('pt')}"?
@@ -776,7 +820,7 @@ async def search_fatsecret(queries: dict):
                 results = []
                 for idx in valid_indices[:3]:
                     best_food = foods_data[idx]
-                    logger.info(f"🎯 FatSecret Selected Candidate: {best_food['food_name']}")
+                    logger.debug("FatSecret: candidato selecionado.")
                     
                     # Fetch details - SEM region e language
                     food_id = best_food["food_id"]
@@ -840,27 +884,24 @@ async def is_food_message(text: str) -> bool:
         logger.warning(f"is_food_message fallback to pipeline: {e}")
         return True
 
-async def extract_calories_list(user_id: int, message_text: str = "", image_bytes: bytes = None, fs_chosen_candidate: dict = None):
-    all_items_queries = []
-    search_context = []
+async def extract_calories_list(
+    user_id: int, 
+    message_text: str = "", 
+    image_bytes: bytes = None, 
+    resolved_candidates: list = None,
+    pre_generated_queries: list = None
+):
+    search_context = resolved_candidates or []
+    all_items_queries = pre_generated_queries
     
-    if message_text and not image_bytes:
+    if all_items_queries is None and message_text and not image_bytes:
         all_items_queries = await generate_surgical_query(message_text)
-    
-    if fs_chosen_candidate:
-        search_context.append(fs_chosen_candidate)
-        # Se temos um candidato escolhido, removemos o item correspondente da lista de queries
-        # para não buscá-lo de novo. Usamos a chave 'resolved_query' que injetamos na escolha.
-        resolved = fs_chosen_candidate.get("resolved_query", "").lower()
-        if resolved:
-            all_items_queries = [q for q in all_items_queries if q.get("pt", "").lower() != resolved]
-        else:
-            # Fallback por nome original se não houver resolved_query
-            orig = fs_chosen_candidate.get("original_query", "").lower()
-            all_items_queries = [q for q in all_items_queries if q.get("pt", "").lower() != orig]
+        
+    if all_items_queries is None:
+        all_items_queries = []
 
     # Para cada item identificado na frase, tentamos achar um contexto (âncora)
-    for item_queries in all_items_queries:
+    for idx, item_queries in enumerate(all_items_queries):
         item_found = False
         clean_name_pt = item_queries.get("pt", message_text)
         
@@ -881,7 +922,13 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
                 if match:
                     if len(match) > 1:
                         logger.info(f"Multiple Catalog candidates for '{clean_name_pt}'. Requesting choice.")
-                        return [], None, "needs_choice", json.dumps({"candidates": match, "source": "catalog", "query_name": clean_name_pt})
+                        return [], None, "needs_choice", json.dumps({
+                            "candidates": match, 
+                            "source": "catalog", 
+                            "query_name": clean_name_pt,
+                            "resolved_so_far": search_context,
+                            "pending_queries": all_items_queries[idx:]
+                        })
                     else:
                         cand = match[0]
                         logger.info(f"🎯 Catalog Context Hit: {cand['alimento']}")
@@ -894,7 +941,13 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
             if fs_res:
                 if len(fs_res) > 1:
                     logger.info(f"Multiple FatSecret candidates for '{clean_name_pt}'. Requesting choice.")
-                    return [], None, "needs_choice", json.dumps({"candidates": fs_res, "source": "fatsecret", "query_name": clean_name_pt})
+                    return [], None, "needs_choice", json.dumps({
+                        "candidates": fs_res, 
+                        "source": "fatsecret", 
+                        "query_name": clean_name_pt,
+                        "resolved_so_far": search_context,
+                        "pending_queries": all_items_queries[idx:]
+                    })
                 elif len(fs_res) == 1:
                     cand = fs_res[0]
                     logger.info(f"🔍 FatSecret Context Hit: {cand['alimento']}")
@@ -980,7 +1033,7 @@ async def extract_calories_list(user_id: int, message_text: str = "", image_byte
                 )
             )
             raw_text = res.text
-            logger.info(f"Gemini Vision Raw Response: {raw_text}")
+            logger.debug("Gemini Vision: resposta recebida.")
             data = json.loads(raw_text)
             is_label = data.get("is_nutrition_label", False)
             foods = data.get("foods", [])
@@ -1079,9 +1132,24 @@ NÃO chute o peso! Use {int(peso_calculado_python)}g para sua Regra de Três.
                 temperature=0,
             )
             raw_data = completion.choices[0].message.content
-            logger.info(f"Groq Unified Extraction Response: {raw_data}")
+            logger.debug("Groq Unified Extraction: resposta recebida.")
             parsed = json.loads(raw_data)
-            foods = parsed.get("itens") or parsed.get("foods") or []
+            foods = parsed.get("itens") or parsed.get("foods") or parsed.get("alimentos") or []
+
+            # Validação crítica: garante lista de dicts sanitizados
+            if not isinstance(foods, list):
+                foods = [foods] if isinstance(foods, dict) else []
+            valid_foods = []
+            for f in foods:
+                if not isinstance(f, dict) or not f.get("alimento"):
+                    logger.warning("Item inválido ignorado na extração.")
+                    continue
+                f["calorias"] = int(float(f.get("calorias", 0)))
+                f["proteina"] = float(f.get("proteina", 0))
+                f["carboidratos"] = float(f.get("carboidratos", 0))
+                f["gorduras"] = float(f.get("gorduras", 0))
+                valid_foods.append(f)
+            foods = valid_foods
             
             # Recover flags if we used search_context
             if search_context:
@@ -1846,7 +1914,9 @@ async def _handle_extraction_result(
             fs_candidates=candidates, 
             original_text=original_text, 
             choice_source=source, 
-            query_name=data.get("query_name")
+            query_name=data.get("query_name"),
+            resolved_so_far=data.get("resolved_so_far", []),
+            pending_queries=data.get("pending_queries", [])
         )
         if source == "catalog":
             await message.answer("✅ **Encontrei no nosso banco verificado.** Qual se aproxima mais do que você consumiu?", reply_markup=kb, parse_mode="Markdown")
@@ -1866,6 +1936,9 @@ async def _handle_extraction_result(
 @dp.message(F.photo)
 async def handle_photo(message: types.Message, state: FSMContext):
     if await state.get_state(): await state.clear()
+    if not check_rate_limit(message.from_user.id):
+        await message.answer("⏱️ Muitos pedidos em pouco tempo. Aguarde um minuto!")
+        return
     try:
         status_msg = await message.answer("Analisando foto... 📸👀")
         
@@ -1910,6 +1983,9 @@ async def handle_photo(message: types.Message, state: FSMContext):
 async def handle_voice(message: types.Message, state: FSMContext):
     """Lida com mensagens de áudio, transcreve com Whisper e processa como texto."""
     if await state.get_state(): await state.clear()
+    if not check_rate_limit(message.from_user.id):
+        await message.answer("⏱️ Muitos pedidos em pouco tempo. Aguarde um minuto!")
+        return
     global user_history
 
     try:
@@ -1971,6 +2047,9 @@ async def handle_text(message: types.Message, state: FSMContext):
     if await state.get_state(): await state.clear()
     global user_history
     try:
+        if not check_rate_limit(message.from_user.id):
+            await message.answer("⏱️ Muitos pedidos em pouco tempo. Aguarde um minuto!")
+            return
         msg_id = f"{message.chat.id}:{message.message_id}"
         now_ts = time.time()
         expired_keys = [k for k, v in processed_messages.items() if now_ts - v > 300]
@@ -1998,7 +2077,7 @@ async def handle_text(message: types.Message, state: FSMContext):
         if is_jailbreak(message.text):
             jailbreak_users[user_id] = True
             await status_msg.delete()
-            await message.answer("Eae amigão, ta tentando mandar um Jailbreak para CaloriesBot? Não vai conseguir.")
+            await message.answer("Desculpa, não entendi sua mensagem. Você quer registrar alguma comida? 🍎")
             return
 
         if not await is_food_message(message.text):
@@ -2027,14 +2106,19 @@ async def process_fs_choice(callback: types.CallbackQuery, state: FSMContext):
     original_text = data.get("original_text", "")
     source = data.get("choice_source", "fatsecret")
     query_name = data.get("query_name")
+    resolved_so_far = data.get("resolved_so_far", [])
+    pending_queries = data.get("pending_queries", [])
     
     if choice == "none":
         if source == "catalog":
             await callback.message.edit_text("🔄 Nenhuma serviu? Buscando opções globais (FatSecret)...", parse_mode="Markdown")
-            await state.clear()
             
-            queries_list = await generate_surgical_query(original_text)
-            queries = queries_list[0] if queries_list else {"pt": original_text, "en_spec": original_text, "en_gen": original_text}
+            if pending_queries:
+                queries = pending_queries[0]
+            else:
+                queries_list = await generate_surgical_query(original_text)
+                queries = queries_list[0] if queries_list else {"pt": original_text, "en_spec": original_text, "en_gen": original_text}
+                
             fs_res = await search_fatsecret(queries)
             if fs_res:
                 if len(fs_res) > 1:
@@ -2049,7 +2133,9 @@ async def process_fs_choice(callback: types.CallbackQuery, state: FSMContext):
                         fs_candidates=fs_res, 
                         original_text=original_text, 
                         choice_source="fatsecret", 
-                        query_name=query_name
+                        query_name=query_name,
+                        resolved_so_far=resolved_so_far,
+                        pending_queries=pending_queries
                     )
                     await callback.message.answer("🔍 **Pesquisa Global.** Qual se aproxima mais?", reply_markup=kb, parse_mode="Markdown")
                     await state.set_state(FatSecretState.waiting_for_choice)
@@ -2063,24 +2149,39 @@ async def process_fs_choice(callback: types.CallbackQuery, state: FSMContext):
                     await save_to_universal_catalog(chosen)
                     
                     msg = await callback.message.answer(f"✅ Encontrado no Global: **{chosen['alimento']}**.\nCalculando porção...", parse_mode="Markdown")
+                    resolved_so_far.append(chosen)
+                    if pending_queries: pending_queries.pop(0)
+
                     items, barcode, error_type, raw_data = await extract_calories_list(
                         user_id=callback.from_user.id,
                         message_text=original_text,
-                        fs_chosen_candidate=chosen
+                        resolved_candidates=resolved_so_far,
+                        pre_generated_queries=pending_queries
                     )
-                    if error_type:
-                        await msg.edit_text("❌ Erro na extração. Tente novamentee.")
-                    elif items is not None and len(items) == 0:
-                        await msg.edit_text("🤔 A opção selecionada não gerou nenhum alimento válido.")
-                    else:
-                        await msg.delete() # Remove loading
-                        await process_food_entry(callback.message, items, raw_data, callback.from_user.id, callback.from_user.full_name)
+                    await msg.delete()
+                    await _handle_extraction_result(callback.message, state, items, error_type, raw_data, original_text, callback.from_user.id, callback.from_user.full_name)
                     return
-            await callback.message.answer("❌ Não encontrei nada nem no banco global. Tente descrever com outras palavras!")
+                    
+            await callback.message.answer(f"❌ Não encontrei `{query_name}` no banco global. Ignorando este item.")
+            if pending_queries: pending_queries.pop(0)
+            items, barcode, error_type, raw_data = await extract_calories_list(
+                user_id=callback.from_user.id,
+                message_text=original_text,
+                resolved_candidates=resolved_so_far,
+                pre_generated_queries=pending_queries
+            )
+            await _handle_extraction_result(callback.message, state, items, error_type, raw_data, original_text, callback.from_user.id, callback.from_user.full_name)
             return
         else:
-            await callback.message.edit_text("Entendido. Opções ignoradas. Tente descrever com outras palavras ou mande uma foto do rótulo!")
-            await state.clear()
+            await callback.message.edit_text(f"Entendido. Ignorando `{query_name}`. Continuando...")
+            if pending_queries: pending_queries.pop(0)
+            items, barcode, error_type, raw_data = await extract_calories_list(
+                user_id=callback.from_user.id,
+                message_text=original_text,
+                resolved_candidates=resolved_so_far,
+                pre_generated_queries=pending_queries
+            )
+            await _handle_extraction_result(callback.message, state, items, error_type, raw_data, original_text, callback.from_user.id, callback.from_user.full_name)
             return
     
     try:
@@ -2091,7 +2192,7 @@ async def process_fs_choice(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer("Opção inválida.")
         await state.clear()
         return
-        
+
     chosen = candidates[idx]
     chosen["alimento"] = chosen.get("original_query", chosen["alimento"])
     
@@ -2100,26 +2201,19 @@ async def process_fs_choice(callback: types.CallbackQuery, state: FSMContext):
     if query_name: chosen["resolved_query"] = query_name
     await save_to_universal_catalog(chosen)
     
-    await callback.message.edit_text(f"✅ Você escolheu: **{chosen['alimento']}**.\nCalculando porção...", parse_mode="Markdown")
+    msg = await callback.message.answer(f"✅ Selecionado: **{chosen['alimento']}**.\nAnalisando o restante...", parse_mode="Markdown")
     
-    # Prossegue com text extraction usando o candidato selecionado como base
+    resolved_so_far.append(chosen)
+    if pending_queries: pending_queries.pop(0)
+    
     items, barcode, error_type, raw_data = await extract_calories_list(
         user_id=callback.from_user.id,
         message_text=original_text,
-        fs_chosen_candidate=chosen
+        resolved_candidates=resolved_so_far,
+        pre_generated_queries=pending_queries
     )
-    
-    await state.clear()
-    
-    if error_type:
-        await callback.message.answer(f"❌ Erro na extração. Tente novamentee.")
-        return
-        
-    if items is not None and len(items) == 0:
-        await callback.message.answer("🤔 Opcão selecionada não gerou nenhum alimento válido na porção descrita.")
-        return
-        
-    await process_food_entry(callback.message, items, raw_data, callback.from_user.id, callback.from_user.full_name)
+    await msg.delete()
+    await _handle_extraction_result(callback.message, state, items, error_type, raw_data, original_text, callback.from_user.id, callback.from_user.full_name)
 
 # --- FastAPI Webhook ---
 

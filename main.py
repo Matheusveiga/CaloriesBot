@@ -1918,10 +1918,11 @@ async def _handle_extraction_result(
             resolved_so_far=data.get("resolved_so_far", []),
             pending_queries=data.get("pending_queries", [])
         )
+        query_name = data.get("query_name", "este item")
         if source == "catalog":
-            await message.answer("✅ **Encontrei no nosso banco verificado.** Qual se aproxima mais do que você consumiu?", reply_markup=kb, parse_mode="Markdown")
+            await message.answer(f"✅ **Banco Verificado:** Para `{query_name}`, qual se aproxima mais?", reply_markup=kb, parse_mode="Markdown")
         else:
-            await message.answer("🔍 **Encontrei opções globais.** Qual se aproxima mais do que você consumiu?", reply_markup=kb, parse_mode="Markdown")
+            await message.answer(f"🔍 **Busca Global:** Para `{query_name}`, qual se aproxima mais?", reply_markup=kb, parse_mode="Markdown")
         await state.set_state(FatSecretState.waiting_for_choice)
         return
     elif error_type:
@@ -2099,6 +2100,13 @@ async def handle_text(message: types.Message, state: FSMContext):
 @dp.callback_query(FatSecretState.waiting_for_choice, F.data.startswith("fsc_"))
 async def process_fs_choice(callback: types.CallbackQuery, state: FSMContext):
     """Lida com a seleção do usuário na multi-escolha do FatSecret ou Catálogo."""
+    
+    # Remove o teclado imediatamente para evitar cliques duplos que corrompem o estado
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except:
+        pass
+
     choice = callback.data.split("_")[1]
     
     data = await state.get_data()
@@ -2111,7 +2119,7 @@ async def process_fs_choice(callback: types.CallbackQuery, state: FSMContext):
     
     if choice == "none":
         if source == "catalog":
-            await callback.message.edit_text("🔄 Nenhuma serviu? Buscando opções globais (FatSecret)...", parse_mode="Markdown")
+            await callback.message.edit_text(f"🔄 Nenhuma serviu para `{query_name}`? Buscando opções globais...", parse_mode="Markdown")
             
             if pending_queries:
                 queries = pending_queries[0]
@@ -2137,7 +2145,7 @@ async def process_fs_choice(callback: types.CallbackQuery, state: FSMContext):
                         resolved_so_far=resolved_so_far,
                         pending_queries=pending_queries
                     )
-                    await callback.message.answer("🔍 **Pesquisa Global.** Qual se aproxima mais?", reply_markup=kb, parse_mode="Markdown")
+                    await callback.message.answer(f"🔍 **Busca Global:** Para `{query_name}`, qual se aproxima mais?", reply_markup=kb, parse_mode="Markdown")
                     await state.set_state(FatSecretState.waiting_for_choice)
                     return
                 elif len(fs_res) == 1:

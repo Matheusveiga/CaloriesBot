@@ -32,3 +32,31 @@ Para garantir 100% de acerto nas calorias, o bot segue este fluxo:
 
 ---
 *Documentado em 18 de Março de 2026.* 🍏🚀
+
+
+## 📄 Script ATS para Avaliar Currículo
+
+Adicionei um utilitário de linha de comando em `ats_resume_evaluator.py` para comparar um currículo exportado em texto com a descrição de uma vaga.
+
+### Como usar
+
+1. Salve o currículo em `curriculo.txt`.
+2. Salve a vaga em `vaga.txt`.
+3. Rode:
+
+```bash
+python ats_resume_evaluator.py curriculo.txt vaga.txt
+```
+
+### O que o script analisa
+
+- aderência de palavras-chave entre currículo e vaga;
+- presença de seções importantes para ATS (`resumo`, `experiência`, `habilidades`, `formação`);
+- dados de contato essenciais;
+- bullets com métricas e alertas de layout que costumam prejudicar parsing.
+
+### Saída em JSON
+
+```bash
+python ats_resume_evaluator.py curriculo.txt vaga.txt --json
+```
